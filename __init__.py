@@ -6,26 +6,48 @@ Main initialization and registration module.
 bl_info = {
     "name": "Blender AI Nodes",
     "author": "Vlad Stoliarenko",
-    "version": (1, 8, 5),
+    "version": (1, 9, 3),
     "blender": (4, 5, 0),
-    "location": "Image Editor > Sidebar > AINodes | Node Editor: AI Nodes",
+    "location": "Image Editor > Sidebar > AI | Node Editor: AI Nodes",
     "description": "AI Nodes (Text/2D/GeoNodes/3D) and Texture projections",
     "warning": "Requires Blender 4.5+ | Internal use only",
     "category": "Image",
 }
 
-
 # =============================================================================
-# GLOBALS VIA BUILTINS (available everywhere without imports)
+# APPLY PENDING .PYD UPDATES (must run BEFORE any .pyd imports)
 # =============================================================================
 
-import builtins
-from .constants import LOG_PREFIX, ADDON_NAME_CONFIG, PANELS_NAME
+import os as _os
 
-builtins.LOG_PREFIX = LOG_PREFIX
-builtins.ADDON_NAME_CONFIG = ADDON_NAME_CONFIG
-builtins.PANELS_NAME = PANELS_NAME
+def _apply_pending_updates():
+    """Replace .pyd/.so files that couldn't be overwritten during last update."""
+    addon_dir = _os.path.dirname(_os.path.abspath(__file__))
+    applied = 0
+    for root, dirs, files in _os.walk(addon_dir):
+        for f in files:
+            if f.endswith('.pending'):
+                pending = _os.path.join(root, f)
+                target = pending[:-8]  # strip ".pending"
+                try:
+                    if _os.path.exists(target):
+                        _os.remove(target)
+                    _os.rename(pending, target)
+                    applied += 1
+                except Exception as e:
+                    print(f"[AINODES] Failed to apply pending update for {f}: {e}")
+    if applied:
+        print(f"[AINODES] Applied {applied} pending file update(s)")
+    # Also clean up leftover .pyd.old files from previous updates
+    for root, dirs, files in _os.walk(addon_dir):
+        for f in files:
+            if f.endswith(('.pyd.old', '.so.old')):
+                try:
+                    _os.remove(_os.path.join(root, f))
+                except Exception:
+                    pass
 
+_apply_pending_updates()
 
 # =============================================================================
 # IMPORTS
@@ -35,6 +57,7 @@ import time as _time
 
 import bpy
 from bpy.app.handlers import persistent
+from .constants import LOG_PREFIX, ADDON_NAME_CONFIG
 
 if bpy.app.version < (4, 5, 0):
     raise Exception(
@@ -53,36 +76,28 @@ from . import nodes
 from . import update
 
 
-# =============================================================================
-# STARTUP KEY VALIDATION (with cooldown to prevent spam)
-# =============================================================================
-
-_last_key_check = 0.0
-_KEY_CHECK_COOLDOWN = 30.0  # seconds
-
-
-def _run_key_check():
-    """Validate API keys once. Cooldown prevents duplicate calls."""
-    global _last_key_check
-    now = _time.time()
-    if now - _last_key_check < _KEY_CHECK_COOLDOWN:
-        return
-    _last_key_check = now
-    try:
-        if bpy.context.window_manager:
-            bpy.ops.neuro.validate_keys()
-            print(f"[{LOG_PREFIX}] Auto-validated API keys")
-    except Exception:
-        _last_key_check = 0.0  # Allow retry on failure
-
-
 @persistent
 def _load_handler(dummy):
-    """Handle file load — refresh previews and re-check API keys."""
-    global _last_key_check
-    _last_key_check = 0.0  # Reset cooldown so new scene gets checked
+    """Handle file load — refresh previews, re-check API keys, restore token."""
     bpy.app.timers.register(utils.trigger_preview_refresh, first_interval=0.5)
-    bpy.app.timers.register(_run_key_check, first_interval=3.0)
+    bpy.app.timers.register(_restore_neurotoken_on_load, first_interval=2.0)
+
+
+def _restore_neurotoken_on_load():
+    """Restore token state after scene load (runs in background thread)."""
+    import threading
+
+    def _worker():
+        try:
+            from .token_utils import restore_neurotoken_state
+            restored = restore_neurotoken_state()
+            if restored:
+                print(f"[{LOG_PREFIX}] Token state restored")
+        except Exception as e:
+            print(f"[{LOG_PREFIX}] Token restore error: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return None  # Don't repeat timer
 
 
 # =============================================================================
@@ -121,6 +136,7 @@ def register():
     ui.register()
     nodes.register()
     update.register()
+    # texture_scan.register()
 
     # 5. Delayed session init (background thread, no UI freeze)
     def _delayed_init():
@@ -156,8 +172,6 @@ def register():
         registry = model_registry.get_registry()
         models = registry.get_all()
         print(f"[{LOG_PREFIX}] Model Registry: {len(models)} models registered")
-        for m in models:
-            log_verbose(f"{m.provider.name}: {m.id} . Endpoint: {m.endpoint}", "REGISTERED")
     except Exception as e:
         print(f"[{LOG_PREFIX}] Model Registry load warning: {e}")
 
@@ -167,7 +181,6 @@ def register():
 
     bpy.app.timers.register(utils.trigger_preview_refresh, first_interval=1.0)
     bpy.app.timers.register(utils.cleanup_orphaned_temps, first_interval=1.0)
-    bpy.app.timers.register(_run_key_check, first_interval=3.0)
     bpy.app.timers.register(utils.reset_ui_states, first_interval=0.5)
     bpy.app.timers.register(utils.load_bundled_node_groups, first_interval=6.0)
 
@@ -201,6 +214,7 @@ def unregister():
     operators.unregister()
     properties.unregister()
     dependencies.unregister()
+    # texture_scan.unregister()
 
     utils.cleanup_preview_collection()
     utils.unregister_cleanup()

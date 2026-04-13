@@ -15,6 +15,7 @@ from .utils import (
     license_key_update,
 )
 from bpy.types import Operator
+from .constants import LOG_PREFIX, PANELS_NAME, TOKEN_NAME
 
 
 def update_api_status(self, context):
@@ -68,11 +69,52 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
         subtype='PASSWORD',
     )
 
-    aiml_api_key: bpy.props.StringProperty(
-        name="AIML API Key",
-        description="Your AIML API Key",
+    # --- Photoshop Bridge ---
+    photoshop_exe_path: bpy.props.StringProperty(
+        name="Photoshop Path",
+        description="Path to Photoshop executable (e.g. C:/Program Files/Adobe/.../Photoshop.exe)",
+        subtype='FILE_PATH',
+        default="",
+    )
+
+    editor_type: bpy.props.EnumProperty(
+        name="Editor",
+        items=[
+            ('BLENDER', "Blender", "Open images in Blender's built-in paint editor"),
+            ('PHOTOSHOP', "Photoshop", "Open images in Adobe Photoshop"),
+        ],
+        default='BLENDER',
+    )
+
+    # --- Token ---
+    neurotoken_key: bpy.props.StringProperty(
+        name="Token Key",
+        description="Your Token key for unified AI credits",
         subtype='PASSWORD',
-        update=update_api_status
+    )
+
+    neurotoken_status: bpy.props.EnumProperty(
+        name="Token Status",
+        items=[
+            ('NONE', "None", "Not activated"),
+            ('ACTIVE', "Active", "Token is active"),
+            ('INVALID', "Invalid", "Key is invalid"),
+            ('PENDING', "Pending", "Validation in progress"),
+        ],
+        default='NONE',
+        options={'SKIP_SAVE'},
+    )
+
+    neurotoken_message: bpy.props.StringProperty(
+        name="Token Message",
+        default="",
+        options={'SKIP_SAVE'},
+    )
+
+    neurotoken_user_id: bpy.props.StringProperty(
+        name="Token User",
+        default="",
+        options={'SKIP_SAVE'},
     )
 
     # Provider availability toggles (set in addon prefs)
@@ -94,21 +136,15 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
         default=True,
     )
 
-    provider_aiml_enabled: bpy.props.BoolProperty(
-        name="AIML",
-        description="Enable AIML API models (unified provider)",
-        default=True,
-    )
-
     # Active provider selection (for switching)
     active_provider: bpy.props.EnumProperty(
         name="Active Provider",
         description="Currently active provider for generation",
+        default='google',
         items=[
             ('replicate', "Replicate", "Use Replicate API"),
             ('google', "Google", "Use Google API"),
             ('fal', "Fal", "Use Fal.AI API"),
-            ('aiml', "AIML", "Use AIML API (unified)"),
         ],
     )
 
@@ -125,14 +161,9 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
         name="Fal Image Model",
         default="nano-banana-pro-fal",
     )
-    selected_image_model_aiml: bpy.props.StringProperty(
-        name="AIML Image Model",
-        default="gpt-image-1-aiml",
-    )
-
     selected_text_model_replicate: bpy.props.StringProperty(
         name="Replicate Text Model",
-        default="gpt-5.1",
+        default="gpt-5.4",
     )
     selected_text_model_google: bpy.props.StringProperty(
         name="Google Text Model",
@@ -145,11 +176,6 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
 
     # === FAL OPTIONS ===
     # Text/LLM source (Fal has no native LLM)
-    fal_text_from_aiml: bpy.props.BoolProperty(
-        name="AIML Text Models",
-        description="Use AIML text models when Fal is active (conflicts with Replicate text)",
-        default=True,
-    )
     fal_text_from_google: bpy.props.BoolProperty(
         name="Google (Gemini)",
         description="Use Google Gemini for text/LLM operations when Fal is active (Free tier, region restricted)",
@@ -157,20 +183,13 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
     )
     fal_text_from_replicate: bpy.props.BoolProperty(
         name="Replicate",
-        description="Use Replicate for text/LLM operations when Fal is active (conflicts with AIML text)",
+        description="Use Replicate for text/LLM operations when Fal is active",
         default=False,
     )
     # Image models addon
     fal_include_google_models: bpy.props.BoolProperty(
         name="Add Google Models",
         description="Include Google image and LLM models in model list when Fal is active",
-        default=False,
-    )
-
-    # === AIML OPTIONS ===
-    aiml_include_google_models: bpy.props.BoolProperty(
-        name="Add Google Models",
-        description="Include Google image and LLM models in model list when AIML is active",
         default=False,
     )
 
@@ -200,7 +219,6 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
         name="Active Tab",
         items=[
             ('CORE', "Core", "General settings and license"),
-            ('PROVIDERS', "Providers", "API keys and connections"),
             ('TOOLS', "Tools", "Local AI tools"),
             ('TOKEN', "NeuroToken", "Unified token system"),
             ('DEV', "Dev", "Developer options"),
@@ -274,10 +292,9 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
         # --- TAB BAR ---
         row = layout.row(align=True)
         row.prop_enum(self, "active_tab", "CORE", icon='PREFERENCES')
-        row.prop_enum(self, "active_tab", "PROVIDERS", icon='WORLD')
         row.prop_enum(self, "active_tab", "TOOLS", icon='MODIFIER')
 
-        # NeuroToken tab (hide for internal builds)
+        # Token tab (hide for internal builds)
         # is_internal() returns True for BOTH hardcoded key AND config file builds
         is_internal_build = False
         try:
@@ -286,7 +303,9 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
         except Exception:
             pass
 
-        if not is_internal_build:
+        if is_internal_build:
+            row.prop_enum(self, "active_tab", "TOKEN", text="Credits", icon='FILE_VOLUME')
+        else:
             row.prop_enum(self, "active_tab", "TOKEN", icon='FILE_VOLUME')
 
         if self.show_dev_tools:  # Only show Dev tab if enabled, or hidden toggle?
@@ -381,6 +400,7 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
                 import traceback
                 traceback.print_exc()
 
+            layout.separator()
             # Language
             lang_box = layout.box()
             row = lang_box.row()
@@ -400,127 +420,10 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
             # Feedback
             box = layout.box()
             box.label(text="Feedback & Support", icon='HELP')
-            box.label(text="For bug reports and feature requests:")
-            if is_internal_build:
-                op = box.operator("neuro.copy_text", text="vladislav.stolyarenko@vizor-games.com", icon='COPYDOWN')
-                op.text = "vladislav.stolyarenko@vizor-games.com"
-            else:
-                op = box.operator("neuro.copy_text", text="contact@neuronodes.io", icon='COPYDOWN')
-                op.text = "contact@neuronodes.io"
-
-
-
-        # =================================================================
-        # TAB: PROVIDERS
-        # =================================================================
-        elif self.active_tab == 'PROVIDERS':
-            row = layout.row()
-            row.operator("neuro.test_all_connections", text="Test All Connections", icon='CHECKMARK')
-            layout.separator()
-
-            # PRIMARY KEYS
-            box = layout.box()
-            box.label(text="Primary Keys", icon='KEY_HLT')
-            col = box.column(align=True)
-
-            # AIML
-            row = col.row(align=True)
-            row.operator("neuro.aiml_key_info", text="", icon='QUESTION')
-            row.prop(self, "provider_aiml_enabled", text="",
-                     icon='CHECKMARK' if self.provider_aiml_enabled else 'CHECKBOX_DEHLT')
-            sub = row.row(align=True)
-            sub.enabled = self.provider_aiml_enabled
-            sub.prop(self, "aiml_api_key", text="AIML API")
-            status = getattr(scn, 'neuro_aiml_status', False)
-            row.label(text="", icon='CHECKMARK' if status else 'BLANK1')
-            op = row.operator("neuro.test_api_key", text="", icon='URL')
-            op.provider = 'aiml'
-            col.separator()
-
-            # Fal
-            row = col.row(align=True)
-            row.operator("neuro.fal_key_info", text="", icon='QUESTION')
-            row.prop(self, "provider_fal_enabled", text="",
-                     icon='CHECKMARK' if self.provider_fal_enabled else 'CHECKBOX_DEHLT')
-            sub = row.row(align=True)
-            sub.enabled = self.provider_fal_enabled
-            sub.prop(self, "fal_api_key", text="Fal.AI")
-            status = getattr(scn, 'neuro_fal_status', False)
-            row.label(text="", icon='CHECKMARK' if status else 'BLANK1')
-            op = row.operator("neuro.test_api_key", text="", icon='URL')
-            op.provider = 'fal'
-            col.separator()
-
-            # Google
-            row = col.row(align=True)
-            row.operator("neuro.google_key_info", text="", icon='QUESTION')
-            row.prop(self, "provider_google_enabled", text="",
-                     icon='CHECKMARK' if self.provider_google_enabled else 'CHECKBOX_DEHLT')
-            sub = row.row(align=True)
-            sub.enabled = self.provider_google_enabled
-            sub.prop(self, "gemini_api_key", text="Google API")
-            status = getattr(scn, 'neuro_google_status', False)
-            row.label(text="", icon='CHECKMARK' if status else 'BLANK1')
-            op = row.operator("neuro.test_api_key", text="", icon='URL')
-            op.provider = 'google'
-
-            layout.separator()
-
-            # 3D GENERATION
-            box = layout.box()
-            box.label(text="3D Generation", icon='MESH_MONKEY')
-            col = box.column(align=True)
-
-            # Tripo
-            row = col.row(align=True)
-            row.operator("neuro.tripo_key_info", text="", icon='QUESTION')
-            row.label(text="", icon='CHECKMARK')
-            row.prop(self, "tripo_api_key", text="Tripo 3D")
-            # [CHANGED] Now uses the persistent status from the actual API check
-            status = getattr(scn, 'neuro_tripo_status', False)
-            row.label(text="", icon='CHECKMARK' if status else 'BLANK1')
-            op = row.operator("neuro.test_api_key", text="", icon='URL')
-            op.provider = 'tripo'
-            if self.tripo_api_key and not self.tripo_api_key.startswith("tsk_"):
-                col.label(text="Key should start with 'tsk_'", icon='ERROR')
-
-            # Hunyuan placeholder
-            row = col.row(align=True)
-            row.enabled = False
-            row.label(text="", icon='CHECKBOX_DEHLT')
-            row.label(text="Hunyuan 3D (Alpha)")
-            row.label(text="", icon='TIME')
-
-            layout.separator()
-
-            # BACKUP PROVIDERS
-            box = layout.box()
-            box.label(text="Backup Providers", icon='RECOVER_LAST')
-            col = box.column(align=True)
-
-            # Replicate
-            row = col.row(align=True)
-            row.operator("neuro.replicate_key_info", text="", icon='QUESTION')
-            row.prop(self, "provider_replicate_enabled", text="",
-                     icon='CHECKMARK' if self.provider_replicate_enabled else 'CHECKBOX_DEHLT')
-            sub = row.row(align=True)
-            sub.enabled = self.provider_replicate_enabled
-            sub.prop(self, "replicate_api_key", text="Replicate")
-            status = getattr(scn, 'neuro_replicate_status', False)
-            row.label(text="", icon='CHECKMARK' if status else 'BLANK1')
-            op = row.operator("neuro.test_api_key", text="", icon='URL')
-            op.provider = 'replicate'
-
-            # OpenAI
-            row = col.row(align=True)
-            row.label(text="", icon='BLANK1')
-            sub = row.row(align=True)
-            sub.enabled = self.provider_replicate_enabled
-            sub.prop(self, "openai_api_key", text="OpenAI (for GPT)")
-            row.label(text="", icon='BLANK1')
-            row.label(text="", icon='BLANK1')
-            col.separator()
-
+            box.operator("neuro.send_feedback", text="Send quick feedback", icon='GREASEPENCIL')
+            box.label(text="For complex topics:")
+            op = box.operator("neuro.copy_text", text="vladislav.stolyarenko@vizor-games.com", icon='COPYDOWN')
+            op.text = "vladislav.stolyarenko@vizor-games.com"
 
 
         # =================================================================
@@ -561,35 +464,91 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
             col.separator(factor=0.6)
             col.label(text="Free local tool, auto-fallback when cloud unavailable")
 
+            # Photoshop Bridge
+            box2 = layout.box()
+            box2.label(text="Photoshop", icon='IMAGE_DATA')
+            row = box2.row(align=True)
+            row.prop(self, "editor_type", expand=True)
+            row = box2.row(align=True)
+            row.prop(self, "photoshop_exe_path", text="PS Path")
+            row.enabled = (self.editor_type == 'PHOTOSHOP')
+
 
         # =================================================================
-        # TAB: NEURO TOKEN
+        # TAB: TOKEN
         # =================================================================
         elif self.active_tab == 'TOKEN':
-            box = layout.box()
+            nt_status = self.neurotoken_status
 
-            box.label(text="NeuroToken", icon='FILE_VOLUME')
+            # ─── ACTIVE STATE ───
+            if nt_status == 'ACTIVE':
+                box = layout.box()
+                # Header row: status + deactivate
+                header = box.row()
+                header.label(text=f"{TOKEN_NAME} Active", icon='CHECKMARK')
 
-            col = box.column()
-            col.scale_y = 1.2
-            col.label(text="Unified AI Credit System", icon='INFO')
-            col.separator()
+                # Balance display
+                col = box.column(align=True)
+                col.scale_y = 1.4
 
-            col.label(text="• One token for all AI providers")
-            col.label(text="• No API key juggling")
-            col.label(text="• Stable model availability")
-            col.label(text="• Priority support")
+                bal = scn.neurotoken_balance or "..."
+                row = col.row(align=True)
+                row.label(text=f"\U0001F9E0  {bal}", icon='FUND')
+                row.operator("neuro.refresh_neurotoken_balance", text="", icon='FILE_REFRESH')
 
-            col.separator()
+                col.scale_y = 1.0
 
-            # Activate button - opens URL
-            row = box.row()
-            row.scale_y = 1
-            row.operator("wm.url_open", text="Activate NeuroToken",
-                         icon='URL').url = "https://neuronodes.io/token"
+                if self.neurotoken_user_id:
+                    col.label(text=f"User: {self.neurotoken_user_id}", icon='USER')
 
-            box.separator()
-            box.label(text="Coming Soon", icon='TIME')
+                box.separator(factor=0.5)
+
+                # Info
+                info = box.column(align=True)
+                info.scale_y = 0.8
+                info.label(text=f"All generation routes through {TOKEN_NAME}.", icon='INFO')
+
+                box.separator()
+
+                # Deactivate
+                row = box.row()
+                row.alert = True
+                row.operator("neuro.deactivate_neurotoken", text="Deactivate", icon='CANCEL')
+
+            # ─── PENDING STATE ───
+            elif nt_status == 'PENDING':
+                box = layout.box()
+                box.label(text=f"{TOKEN_NAME}", icon='FILE_VOLUME')
+                box.label(text="Validating...", icon='SORTTIME')
+
+            # ─── INACTIVE / INVALID STATE ───
+            else:
+                box = layout.box()
+                box.label(text=f"{TOKEN_NAME}", icon='FILE_VOLUME')
+
+                col = box.column(align=True)
+                col.scale_y = 0.85
+                col.label(text="One token system for all AI models.")
+                col.label(text="No API keys needed — just activate and generate.")
+
+                box.separator(factor=0.5)
+
+                # Key input + activate button
+                row = box.row(align=True)
+                row.scale_y = 1.3
+                if nt_status == 'INVALID':
+                    row.alert = True
+                row.prop(self, "neurotoken_key", text="Key")
+                row.operator("neuro.activate_neurotoken", text="", icon='PLAY')
+
+                # Error message
+                if nt_status == 'INVALID' and self.neurotoken_message:
+                    err_row = box.row()
+                    err_row.alert = True
+                    err_row.label(text=self.neurotoken_message, icon='ERROR')
+
+                box.separator()
+
         # =================================================================
         # TAB: DEV
         # =================================================================
@@ -603,11 +562,13 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
             row = dev_box.row()
             row.operator("neuro.check_package_updates", text="Check for Package Updates", icon='FILE_REFRESH')
 
+            dev_box.label(text="Global settings:", icon='MEMORY')
+            dev_box.prop(scn, "neuro_timeout", text="Timeout (s)")
+
             # Node Editor Settings
-            dev_box.separator()
             dev_box.label(text="Node Editor Settings:", icon='NODE')
             try:
-                # Find active AINodes node tree
+                # Find active Neuro node tree
                 ntree = None
                 for tree in bpy.data.node_groups:
                     if tree.bl_idname == 'NeuroGenNodeTree':
@@ -616,7 +577,7 @@ class NEURO_AddonPreferences(bpy.types.AddonPreferences):
                 if ntree:
                     dev_box.prop(ntree, "preview_scale", text="Preview Size")
                 else:
-                    dev_box.label(text="  No AINodes node tree found")
+                    dev_box.label(text="  No node tree found")
             except Exception:
                 dev_box.label(text="  (Open Node Editor first)")
 
@@ -705,7 +666,7 @@ class NEURO_OT_toggle_model(bpy.types.Operator):
         import json
 
         prefs = None
-        for name in [__package__, "blender_ai_nodes", "ai_nodes"]:
+        for name in [__package__, "ai_nodes"]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -729,6 +690,12 @@ class NEURO_OT_toggle_model(bpy.types.Operator):
 
         # Save back
         prefs.disabled_models = json.dumps(disabled)
+        # === PERF: Invalidate enum caches (model list changed) ===
+        try:
+            from .nodes_items.base import invalidate_model_enum_cache
+            invalidate_model_enum_cache()
+        except ImportError:
+            pass
 
         # Update registry model state
         try:
@@ -753,7 +720,7 @@ class NEURO_OT_validate_license(Operator):
         from .config import init_session, get_token
 
         prefs = None
-        for name in [__package__, "blender_ai_nodes", "ai_nodes"]:
+        for name in [__package__, "ai_nodes"]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -799,28 +766,7 @@ class NEURO_OT_test_api_key(bpy.types.Operator):
 
         self.report({'INFO'}, f"Testing {provider}...")
 
-        # --- AIML: Delegate (Special Case) ---
-        if provider == 'aiml':
-            if prefs.aiml_api_key:
-                if hasattr(bpy.ops.aiml, "refresh_balance"):
-                    try:
-                        def trigger_aiml():
-                            bpy.ops.aiml.refresh_balance()
-                            return None
-
-                        bpy.app.timers.register(trigger_aiml)
-                    except Exception as e:
-                        print(f"[{LOG_PREFIX}] AIML Launch Failed: {e}")
-                        scn.neuro_aiml_status = False
-                else:
-                    self.report({'WARNING'}, "AIML operator missing")
-            else:
-                self.report({'ERROR'}, "No AIML Key provided")
-                scn.neuro_aiml_status = False
-
-            return {'FINISHED'}
-
-        # --- OTHERS: Threaded Logic ---
+        # --- Threaded Logic ---
         def test_connection():
             success = False
             try:
@@ -914,7 +860,6 @@ class NEURO_OT_test_api_key(bpy.types.Operator):
                     scn.neuro_replicate_status = success
                 elif provider == 'fal':
                     scn.neuro_fal_status = success
-                # (AIML handles its own status)
                 return None
 
             bpy.app.timers.register(update_status, first_interval=0.1)
@@ -943,7 +888,7 @@ class NEURO_OT_test_all_connections(bpy.types.Operator):
 # =============================================================================
 
 class NEURO_PT_panel(bpy.types.Panel):
-    bl_label = "Blender AI Generations"
+    bl_label = "Blender Texture Generations"
     bl_idname = "IMAGE_PT_neuro"
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
@@ -1035,6 +980,31 @@ class NEURO_PT_panel(bpy.types.Panel):
 
     def draw_texture_mode(self, input_box, scn):
         """Draw Texture mode UI elements."""
+        # Object Merger — collapsible, destructive prep on a copy
+        merger_row = input_box.row()
+        merger_row.prop(scn, "neuro_show_merger",
+                        icon='TRIA_DOWN' if scn.neuro_show_merger else 'TRIA_RIGHT',
+                        emboss=False, text="Object Merger")
+        if scn.neuro_show_merger:
+            m = input_box.box()
+            m.prop(scn, "neuro_merger_collection", text="Collection")
+            btn_row = m.row()
+            btn_row.scale_y = 1.3
+            btn_row.enabled = scn.neuro_merger_collection is not None
+            btn_row.operator("neuro.merge_for_texture", text="Merge & Prepare", icon='AUTOMERGE_ON')
+
+        # Active object indicator — always visible in texture mode
+        act = bpy.context.active_object
+        obj_row = input_box.row()
+        if act and act.type == 'MESH':
+            obj_row.label(text=f"Active: {act.name}", icon='OBJECT_DATA')
+        elif act:
+            obj_row.alert = True
+            obj_row.label(text=f"Active: {act.name} (not a mesh)", icon='ERROR')
+        else:
+            obj_row.alert = True
+            obj_row.label(text="No active object", icon='ERROR')
+
         builder_box = input_box.box()
         builder_box.label(text="Texture Builder", icon='MODIFIER')
         builder_box.prop(scn, "neuro_texture_obj_desc")
@@ -1165,88 +1135,35 @@ class NEURO_PT_panel(bpy.types.Panel):
                     prefs = context.preferences.addons[name].preferences
                     break
 
-            # Provider switch (same as node editor)
-            if prefs:
-                prov_box = box.box()
-                prov_box.label(text="Active Provider:", icon='WORLD')
-                row = prov_box.row(align=True)
+            try:
+                from .token_utils import is_nt_active
+                nt_active = is_nt_active()
+            except Exception:
+                nt_active = False
 
-                # Use operator buttons for proper model persistence
-                if prefs.provider_replicate_enabled:
-                    op = row.operator("neuro.switch_provider",
-                                      text="Replicate",
-                                      depress=(prefs.active_provider == 'replicate'))
-                    op.provider = 'replicate'
-                if prefs.provider_google_enabled:
-                    op = row.operator("neuro.switch_provider",
-                                      text="Google",
-                                      depress=(prefs.active_provider == 'google'))
-                    op.provider = 'google'
-                if prefs.provider_fal_enabled:
-                    op = row.operator("neuro.switch_provider",
-                                      text="Fal",
-                                      depress=(prefs.active_provider == 'fal'))
-                    op.provider = 'fal'
-                if prefs.provider_aiml_enabled:
-                    op = row.operator("neuro.switch_provider",
-                                      text="AIML",
-                                      depress=(prefs.active_provider == 'aiml'))
-                    op.provider = 'aiml'
-
-                # Fal Text Source Options (shown when Fal is active)
-                if prefs.active_provider == 'fal':
-                    fal_box = prov_box.box()
-                    fal_box.label(text="Text/LLM Source:", icon='TEXT')
-
-                    # AIML option with connection status
-                    row = fal_box.row(align=True)
-                    row.prop(prefs, "fal_text_from_aiml", text="")
-                    sub = row.row(align=True)
-                    sub.enabled = prefs.fal_text_from_aiml
-                    aiml_status = scn.neuro_aiml_status if hasattr(scn, 'neuro_aiml_status') else False
-                    status_icon = 'CHECKMARK' if aiml_status else 'ERROR'
-                    sub.label(text="AIML Text", icon=status_icon)
-                    if prefs.fal_text_from_aiml and prefs.fal_text_from_replicate:
-                        sub.label(text="[conflicts]")
-                        sub.alert = True
-
-                    # Replicate option with connection status
-                    row = fal_box.row(align=True)
-                    row.prop(prefs, "fal_text_from_replicate", text="")
-                    sub = row.row(align=True)
-                    sub.enabled = prefs.fal_text_from_replicate
-                    rep_status = scn.neuro_replicate_status if hasattr(scn, 'neuro_replicate_status') else False
-                    status_icon = 'CHECKMARK' if rep_status else 'ERROR'
-                    sub.label(text="Replicate Text", icon=status_icon)
-                    if prefs.fal_text_from_aiml and prefs.fal_text_from_replicate:
-                        sub.label(text="[conflicts]")
-                        sub.alert = True
-
-                    # Warning if nothing selected
-                    if not prefs.fal_text_from_aiml and not prefs.fal_text_from_replicate:
-                        warn_row = fal_box.row()
-                        warn_row.alert = True
-                        warn_row.label(text="No text source! Prompt upgrade disabled", icon='ERROR')
-
-                    # Add Models section
-                    fal_box.separator()
-                    fal_box.label(text="Add Models:", icon='PLUS')
-                    row = fal_box.row(align=True)
-                    row.prop(prefs, "fal_include_google_models", text="")
-                    sub = row.row(align=True)
-                    sub.enabled = prefs.fal_include_google_models
-                    google_status = scn.neuro_google_status if hasattr(scn, 'neuro_google_status') else False
-                    sub.label(text="Google Image/LLMs", icon='CHECKMARK' if google_status else 'ERROR')
+            nt_row = box.row(align=True)
+            if nt_active:
+                bal = getattr(scn, 'neurotoken_balance', '') or '...'
+                nt_row.label(text=f"Token  Credits: {bal}", icon='FUND')
+                nt_row.operator("neuro.refresh_neurotoken_balance", text="", icon='FILE_REFRESH')
+            else:
+                nt_row.alert = True
+                nt_row.label(text="Token not active", icon='ERROR')
 
             box.separator(factor=0.3)
 
-            row = box.row()
-            row.scale_y = 1.2
-            col = row.column(align=True)
-            col.label(text="Generation Model:", icon='RENDER_STILL')
-            col = row.column(align=True)
-            col.scale_x = 1.2
-            col.prop(scn, "neuro_generation_model", text="")
+            if scn.neuro_input_mode == 'TEXTURE':
+                row = box.row(align=True)
+                row.label(text="Model:", icon='RENDER_STILL')
+                row.prop(scn, "neuro_texture_model", expand=True)
+            else:
+                row = box.row()
+                row.scale_y = 1.2
+                col = row.column(align=True)
+                col.label(text="Generation Model:", icon='RENDER_STILL')
+                col = row.column(align=True)
+                col.scale_x = 1.2
+                col.prop(scn, "neuro_generation_model", text="")
 
             row = box.row()
             row.scale_y = 1.2

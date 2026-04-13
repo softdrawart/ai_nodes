@@ -13,11 +13,12 @@ import os
 # VERSION INFO
 # =============================================================================
 
-ADDON_VERSION = (1, 8, 5)
+ADDON_VERSION = (1, 9, 3)
 BLENDER_MIN_VERSION = (4, 5, 0)
 LOG_PREFIX = "AINODES"
 ADDON_NAME_CONFIG = "Blender AI Nodes"
-PANELS_NAME = "AINodes"
+PANELS_NAME = "AI"
+TOKEN_NAME = "ProxyServer"
 
 SYMBOLS = """utf-8 symbols: ✓ (check), ⚠️ (warning/error), ★ (favorites)"""
 
@@ -101,7 +102,7 @@ MODIFIERS_MAP = {
     "neuro_mod_isometric": " isometric view, 2.5D",
     "neuro_mod_detailed": " sharp details, high readability",
     "neuro_mod_clean": " clean background, isolated",
-    "neuro_mod_vibrant": " vibrant colors, joyful palette",
+    "neuro_mod_vibrant": " digital painting",
     "neuro_mod_soft": " soft shading, ambient occlusion, cozy atmosphere",
     "neuro_mod_casual": " casual game asset, mobile game style, unity 3d render",
 }
@@ -126,7 +127,6 @@ def get_assets_path():
 # BUILD METADATA
 # =============================================================================
 
-_BUILD_ID = "VS_INTERNAL_2026_02_11_BUILD_1851"
-_LICENSED_TO = "Vlad Stoliarenko - Company Use"
+_BUILD_ID = "VS_INTERNAL_2026_04_13_BUILD_1931"
+_LICENSED_TO = "Vlad Stoliarenko - for Vizor Games"
 PRODUCT_NAME = "Blender AI Nodes"
-IS_MRKTV = False

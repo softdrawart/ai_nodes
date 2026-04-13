@@ -182,10 +182,21 @@ class NeuroArtistToolsNode(HistoryMixin, NeuroNodeBase, Node):
     status_message: StringProperty(name="Status", default="")
     result_path: StringProperty(name="Result Path", default="")
     model_used: StringProperty(name="Model Used", default="")
+    is_generating: BoolProperty(name="Is Generating", default=False)
 
     # Image history for Upscale/Angle/Variations/Multiview modes
     image_history: StringProperty(name="Image History", default="[]")
     history_index: IntProperty(name="History Index", default=0, min=0)
+
+    use_inpaint: bpy.props.BoolProperty(
+        name="Inpaint",
+        description="When enabled, generation only affects the purple-painted area. "
+                    "Paint the zone first using Open Paint, then enable this toggle",
+        default=False,
+    )
+
+    # PrePaint backup path
+    prepaint_backup: StringProperty(name="PrePaint Backup", default="")
 
     def init(self, context):
         # Reset all instance properties to defaults
@@ -271,7 +282,7 @@ class NeuroArtistToolsNode(HistoryMixin, NeuroNodeBase, Node):
 
         if self.description_result:
             # Show preview if we have result from delete/keep action
-            if self.result_path and os.path.exists(self.result_path):
+            if self.result_path and self._path_exists_cached(self.result_path):
                 self._draw_preview_with_nav(layout)
 
             lines = [l for l in self.description_result.strip().split('\n') if l.strip()]
@@ -352,7 +363,7 @@ class NeuroArtistToolsNode(HistoryMixin, NeuroNodeBase, Node):
     def _draw_flip_mode(self, layout):
         """Draw UI for Flip/Mirror mode"""
         # Show preview if we have result
-        if self.result_path and os.path.exists(self.result_path):
+        if self.result_path and self._path_exists_cached(self.result_path):
             self._draw_preview_with_nav(layout)
 
         # Direction selector
@@ -365,7 +376,7 @@ class NeuroArtistToolsNode(HistoryMixin, NeuroNodeBase, Node):
     def _draw_decompose_mode(self, layout):
         """Draw UI for Decompose mode"""
         # Show preview if we have result
-        if self.result_path and os.path.exists(self.result_path):
+        if self.result_path and self._path_exists_cached(self.result_path):
             self._draw_preview_with_nav(layout)
 
         # Editable prompt field
@@ -378,7 +389,7 @@ class NeuroArtistToolsNode(HistoryMixin, NeuroNodeBase, Node):
     def _draw_separation_mode(self, layout):
         """Draw UI for Separation mode"""
         # Show preview if we have result
-        if self.result_path and os.path.exists(self.result_path):
+        if self.result_path and self._path_exists_cached(self.result_path):
             self._draw_preview_with_nav(layout)
 
         # Mode selector (Separate/Delete)
@@ -404,7 +415,7 @@ class NeuroArtistToolsNode(HistoryMixin, NeuroNodeBase, Node):
     def _draw_upscale_mode(self, layout):
         """Draw UI for Upscale mode"""
         # Show preview if we have result
-        if self.result_path and os.path.exists(self.result_path):
+        if self.result_path and self._path_exists_cached(self.result_path):
             self._draw_preview_with_nav(layout)
 
         # Upscale preset selector
@@ -417,7 +428,7 @@ class NeuroArtistToolsNode(HistoryMixin, NeuroNodeBase, Node):
     def _draw_angle_mode(self, layout):
         """Draw UI for Change Angle mode"""
         # Show preview if we have result
-        if self.result_path and os.path.exists(self.result_path):
+        if self.result_path and self._path_exists_cached(self.result_path):
             self._draw_preview_with_nav(layout)
 
         layout.prop(self, "angle_preset", text="")
@@ -432,7 +443,7 @@ class NeuroArtistToolsNode(HistoryMixin, NeuroNodeBase, Node):
     def _draw_multiview_mode(self, layout):
         """Draw UI for Multiview mode"""
         # Show preview if we have result
-        if self.result_path and os.path.exists(self.result_path):
+        if self.result_path and self._path_exists_cached(self.result_path):
             self._draw_preview_with_nav(layout)
 
         # Editable prompt field
@@ -466,11 +477,34 @@ class NeuroArtistToolsNode(HistoryMixin, NeuroNodeBase, Node):
 
             col.label(text=f"{self.history_index + 1}/{len(history)}")
 
-        # --- ADDED: COPY BUTTON ---
+        # --- ADDED: Full bar ---
         if len(history) > 0:
-            col.separator()
+            col.separator(factor=1.5)
+            op = col.operator("neuro.node_open_paint_smart", text="", icon='BRUSH_DATA')
+            op.node_name = self.name
+
+            if self.prepaint_backup and self._path_exists_cached(self.prepaint_backup):
+                col.separator(factor=0.5)
+                op = col.operator("neuro.node_revert_paint", text="", icon='LOOP_BACK')
+                op.node_name = self.name
+
+            col.separator(factor=0.5)
+            op = col.operator("neuro.node_create_inpaint", text="", icon='CLIPUV_HLT')
+            op.node_name = self.name
+
+            col.separator(factor=2)
             op = col.operator("neuro.node_copy_image_file", text="", icon='COPYDOWN')
             op.image_path = self.result_path
+
+            # Add to shader
+            col.separator(factor=2)
+            op = col.operator("neuro.add_to_shader", text="", icon='NODE_MATERIAL')
+            op.node_name = self.name
+
+            if not self.is_generating:
+                col.separator(factor=2)
+                bg_op = col.operator("neuro.node_remove_bg", text="", icon='IMAGE_RGB_ALPHA')
+                bg_op.node_name = self.name
 
     def get_input_image(self):
         """Get the connected input image path"""

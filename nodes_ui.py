@@ -3,9 +3,55 @@ import os
 import json
 import bpy
 import tempfile
+import time as _time
 from bpy.types import Menu, Panel, Operator, FileHandler
 from bpy.props import StringProperty, CollectionProperty
 from nodeitems_utils import NodeCategory, NodeItem
+from .constants import LOG_PREFIX, PANELS_NAME
+
+_nt_mode_cache = None       # (is_active, timestamp)
+_NT_MODE_CACHE_TTL = 5.0    # seconds
+
+_prefs_cache = None          # (prefs_ref, timestamp)
+_PREFS_CACHE_TTL = 5.0
+
+def _is_neurotoken_mode_cached():
+    """Cached NeuroToken mode check — avoids import chain every frame."""
+    global _nt_mode_cache
+    now = _time.monotonic()
+    if _nt_mode_cache and (now - _nt_mode_cache[1]) < _NT_MODE_CACHE_TTL:
+        return _nt_mode_cache[0]
+
+    result = False
+    try:
+        from .config.config_proxy import is_neurotoken_mode
+        result = is_neurotoken_mode()
+    except ImportError:
+        try:
+            from .config import is_neurotoken_mode
+            result = is_neurotoken_mode()
+        except ImportError:
+            result = False
+
+    _nt_mode_cache = (result, now)
+    return result
+
+
+def _get_prefs_cached(context):
+    """Cached prefs lookup — avoids looping addon names every frame."""
+    global _prefs_cache
+    now = _time.monotonic()
+    if _prefs_cache and (now - _prefs_cache[1]) < _PREFS_CACHE_TTL:
+        return _prefs_cache[0]
+
+    prefs = None
+    for name in [__package__, "ai_nodes"]:
+        if name and name in context.preferences.addons:
+            prefs = context.preferences.addons[name].preferences
+            break
+
+    _prefs_cache = (prefs, now)
+    return prefs
 
 
 def get_unified_models(self, context):
@@ -19,6 +65,7 @@ def get_unified_models(self, context):
         return [("gemini-2.5-flash-image", "Gemini 2.5 Flash", "")]
 
 
+#ToDo
 class NEURO_PT_node_prompt_builder(Panel):
     """Side Panel for Node Prompt Building modifiers"""
     bl_label = "Prompt Builder"
@@ -82,6 +129,16 @@ class NEURO_MT_node_add(Menu):
         layout.operator("node.add_node", text="Design Variations", icon='MOD_ARRAY').type = 'NeuroDesignVariationsNode'
         layout.operator("node.add_node", text="Image Splitter", icon='MOD_EXPLODE').type = 'NeuroImageSplitterNode'
         layout.operator("node.add_node", text="Remove Background", icon='IMAGE_RGB_ALPHA').type = 'NeuroRemoveBackgroundNode'
+        layout.operator("node.add_node", text="Photoshop", icon='LOCKVIEW_ON').type = 'NeuroPSBridgeNode'
+
+        try:
+            from . import nodes_neuro  # noqa: F401
+            layout.separator()
+            layout.label(text="Designing")
+            layout.operator("node.add_node", text="Merge Design", icon='MOD_BUILD').type = 'NeuroMergeStyleNode'
+            layout.operator("node.add_node", text="Concept Finish", icon='OUTLINER_OB_IMAGE').type = 'NeuroConceptMakerNode'
+        except (ImportError, Exception):
+            pass
         layout.separator()
         layout.label(text="Text")
         layout.operator("node.add_node", text="Text Generation", icon='EVENT_T').type = 'NeuroTextGenNode'
@@ -89,11 +146,21 @@ class NEURO_MT_node_add(Menu):
         layout.operator("node.add_node", text="Text", icon='TEXT').type = 'NeuroTextNode'
         layout.operator("node.add_node", text="Merge Text", icon='SORTALPHA').type = 'NeuroMergeTextNode'
         layout.separator()
-        layout.label(text="3D Generation")
+        layout.label(text="3D")
         layout.operator("node.add_node", text="3D Generate (Tripo)", icon='MESH_MONKEY').type = 'TripoGenerateNode'
         layout.operator("node.add_node", text="Smart LowPoly (Tripo)", icon='MOD_DECIM').type = 'TripoSmartLowPolyNode'
         layout.operator("node.add_node", text="AI Geometry Nodes (Beta)",
                         icon='GEOMETRY_NODES').type = 'NeuroGeoNodesNode'
+        # Team nodes (internal only)
+        try:
+            from .config import is_internal
+            if is_internal():
+                layout.separator()
+                layout.label(text="Team")
+                layout.operator("node.add_node", text="Character Texture",
+                                icon='ARMATURE_DATA').type = 'NeuroCharacterTextureNode'
+        except (ImportError, Exception):
+            pass
         layout.separator()
         layout.label(text="Layout")
         layout.operator("node.add_node", text="Frame", icon='NONE').type = 'NodeFrame'
@@ -111,7 +178,7 @@ class NEURO_PT_node_defaults(Panel):
 
         # Get addon preferences
         prefs = None
-        for name in [__package__, "blender_ai_nodes", "ai_nodes"]:
+        for name in [__package__, "ai_nodes"]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -125,17 +192,12 @@ class NEURO_PT_node_defaults(Panel):
         box.label(text="Active Provider:", icon='WORLD')
         row = box.row(align=True)
 
-        # Provider buttons - order: Fal, AIML, Google, Replicate
+        # Provider buttons - order: Fal, Google, Replicate
         if prefs.provider_fal_enabled:
             op = row.operator("neuro.switch_provider",
                               text="Fal",
                               depress=(prefs.active_provider == 'fal'))
             op.provider = 'fal'
-        if prefs.provider_aiml_enabled:
-            op = row.operator("neuro.switch_provider",
-                              text="AIML",
-                              depress=(prefs.active_provider == 'aiml'))
-            op.provider = 'aiml'
         if prefs.provider_google_enabled:
             op = row.operator("neuro.switch_provider",
                               text="Google",
@@ -148,7 +210,6 @@ class NEURO_PT_node_defaults(Panel):
             op.provider = 'replicate'
 
         # Get status indicators
-        aiml_status = getattr(scn, 'neuro_aiml_status', False)
         google_status = getattr(scn, 'neuro_google_status', False)
         fal_status = getattr(scn, 'neuro_fal_status', False)
         rep_status = getattr(scn, 'neuro_replicate_status', False)
@@ -160,28 +221,15 @@ class NEURO_PT_node_defaults(Panel):
             # Text/LLM Source (Fal has no native LLM)
             fal_box.label(text="Text/LLM Source:", icon='TEXT')
 
-            # AIML text option
-            row = fal_box.row(align=True)
-            row.prop(prefs, "fal_text_from_aiml", text="")
-            sub = row.row(align=True)
-            sub.enabled = prefs.fal_text_from_aiml
-            sub.label(text="AIML Text", icon='CHECKMARK' if aiml_status else 'ERROR')
-            if prefs.fal_text_from_aiml and prefs.fal_text_from_replicate:
-                sub.label(text="[conflicts]")
-                sub.alert = True
-
             # Replicate text option
             row = fal_box.row(align=True)
             row.prop(prefs, "fal_text_from_replicate", text="")
             sub = row.row(align=True)
             sub.enabled = prefs.fal_text_from_replicate
             sub.label(text="Replicate Text", icon='CHECKMARK' if rep_status else 'ERROR')
-            if prefs.fal_text_from_aiml and prefs.fal_text_from_replicate:
-                sub.label(text="[conflicts]")
-                sub.alert = True
 
             # Warning if nothing selected
-            if not prefs.fal_text_from_aiml and not prefs.fal_text_from_replicate:
+            if not prefs.fal_text_from_replicate:
                 warn_row = fal_box.row()
                 warn_row.alert = True
                 warn_row.label(text="No text source!", icon='ERROR')
@@ -195,17 +243,6 @@ class NEURO_PT_node_defaults(Panel):
             row.prop(prefs, "fal_include_google_models", text="")
             sub = row.row(align=True)
             sub.enabled = prefs.fal_include_google_models
-            sub.label(text="Google Image/LLMs", icon='CHECKMARK' if google_status else 'ERROR')
-
-        # === AIML OPTIONS ===
-        elif prefs.active_provider == 'aiml':
-            aiml_box = box.box()
-            aiml_box.label(text="Add Models:", icon='PLUS')
-
-            row = aiml_box.row(align=True)
-            row.prop(prefs, "aiml_include_google_models", text="")
-            sub = row.row(align=True)
-            sub.enabled = prefs.aiml_include_google_models
             sub.label(text="Google Image/LLMs", icon='CHECKMARK' if google_status else 'ERROR')
 
         # === GOOGLE OPTIONS ===
@@ -237,24 +274,37 @@ def draw_neuro_header(self, context):
         layout = self.layout
         ntree = context.space_data.node_tree
         scn = context.scene
+        prefs = _get_prefs_cached(context)
 
-        layout.popover(panel="NEURO_PT_node_defaults", text="Providers", icon='WORLD')
-        layout.separator()
+        if not prefs:
+            layout.label(text="Preferences not found", icon='ERROR')
+            return
 
-        # AIML balance display
-        row = layout.row(align=True)
-        if scn.aiml_balance:
-            row.label(text=f"AIML: {scn.aiml_balance}", icon='FUND')
-        row.operator("aiml.refresh_balance", text="", icon='FILE_REFRESH')
+
+        # Token balance (replaces provider-specific balance when active)
+        _nt_active = _is_neurotoken_mode_cached()
+
+
+        if _nt_active:
+            row = layout.row(align=True)
+            nt_bal = scn.neurotoken_balance or "..."
+            row.label(text=f"Credits: {nt_bal}", icon='FUND')
+            row.operator("neuro.refresh_neurotoken_balance", text="", icon='FILE_REFRESH')
+        else:
+            layout.popover(panel="NEURO_PT_node_defaults", text="Providers", icon='WORLD')
+            layout.separator()
 
         # Tripo balance display
         row = layout.row(align=True)
         if scn.tripo_balance:
-            row.label(text=f"Tripo: {scn.tripo_balance}", icon='MESH_MONKEY')
+            row.label(text=f"Tripo {scn.tripo_balance}", icon='MESH_MONKEY')
         row.operator("tripo.refresh_balance", text="", icon='FILE_REFRESH')
         layout.separator()
 
         layout.operator("neuro.run_selection", text="Selection", icon='PLAY')
+        layout.separator()
+
+        layout.popover(panel="NEURO_PT_quick_tools", text="QuickTools", icon='TOOL_SETTINGS')
         layout.separator()
 
         # Mini Translator
@@ -277,7 +327,7 @@ def draw_node_add_menu(self, context):
                                        'tree_type') and context.space_data.tree_type == 'NeuroGenNodeTree'):
         layout = self.layout
         layout.separator()
-        layout.label(text="AINodes")
+        layout.label(text="AI")
         layout.operator("node.add_node", text="Generate / Edit", icon='IMAGE_DATA').type = 'NeuroGenerateNode'
 
 
@@ -298,6 +348,7 @@ neuro_node_CATEGORIES = [
         NodeItem('NeuroDesignVariationsNode'),
         NodeItem('NeuroImageSplitterNode'),
         NodeItem('NeuroRemoveBackgroundNode'),
+        NodeItem('NeuroPSBridgeNode'),
     ]),
     NeuroNodeCategory('NEURO_TEXT', "Text", items=[
         NodeItem('NeuroTextGenNode'), NodeItem('NeuroUpgradePromptNode'), NodeItem('NeuroTextNode'),
@@ -312,6 +363,30 @@ neuro_node_CATEGORIES = [
     ]),
     NeuroNodeCategory('NEURO_GEO', "Geometry Nodes", items=[NodeItem('NeuroGeoNodesNode'), ]),
 ]
+
+# Append Designing category if nodes_neuro package is present
+try:
+    from . import nodes_neuro  # noqa: F401
+    neuro_node_CATEGORIES.insert(2,
+        NeuroNodeCategory('NEURO_DESIGNING', "Designing", items=[
+            NodeItem('NeuroMergeStyleNode'),
+            NodeItem('NeuroConceptMakerNode'),
+        ])
+    )
+except (ImportError, Exception):
+    pass
+
+# Append Team category for internal builds only
+try:
+    from .config import is_internal
+    if is_internal():
+        neuro_node_CATEGORIES.append(
+            NeuroNodeCategory('NEURO_TEAM', "Team", items=[
+                NodeItem('NeuroCharacterTextureNode'),
+            ])
+        )
+except (ImportError, Exception):
+    pass
 
 
 class NEURO_OT_show_add_menu(Operator):
@@ -346,26 +421,15 @@ class NEURO_OT_paste_reference_node(Operator):
             self.report({'WARNING'}, "No node tree active")
             return {'CANCELLED'}
 
-        # --- Calculate Node Position from Mouse ---
+        # --- Calculate Node Position: near active/selected nodes ---
         node_x, node_y = 0, 0
-
-        # When shortcut is pressed with mouse in the node editor WINDOW region,
-        # context.region is WINDOW and mouse_region_x/y are already region-local
-        if context.region.type == 'WINDOW' and hasattr(context.region, 'view2d'):
-            node_x, node_y = context.region.view2d.region_to_view(
-                event.mouse_region_x,
-                event.mouse_region_y
-            )
-        else:
-            # Fallback: mouse might be in header/sidebar when shortcut pressed
-            # Use 2D cursor or view center
-            if hasattr(context.space_data, 'cursor_location'):
-                node_x, node_y = context.space_data.cursor_location
-            else:
-                for r in context.area.regions:
-                    if r.type == 'WINDOW' and hasattr(r, 'view2d'):
-                        node_x, node_y = r.view2d.region_to_view(r.width // 2, r.height // 2)
-                        break
+        active = ntree.nodes.active
+        if active:
+            node_x = active.location.x + active.width + 80
+            node_y = active.location.y
+        elif ntree.nodes:
+            node_x = sum(n.location.x for n in ntree.nodes) / len(ntree.nodes) + 200
+            node_y = sum(n.location.y for n in ntree.nodes) / len(ntree.nodes)
 
         # --- Get Image from Clipboard ---
         try:
@@ -512,6 +576,7 @@ class NEURO_OT_drop_images(Operator):
 
         # Store all paths in the node
         node.set_image_paths_list(image_paths)
+        node.image_path = image_paths[0]  # backward compat for preview display
 
         num_images = len(image_paths)
         if num_images > MAX_DROP_IMAGES:
@@ -526,6 +591,12 @@ class NEURO_OT_drop_images(Operator):
             n.select = False
         node.select = True
         ntree.nodes.active = node
+
+        # Force redraw
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'NODE_EDITOR':
+                    area.tag_redraw()
 
         return {'FINISHED'}
 
@@ -658,7 +729,7 @@ class NEURO_OT_translate_text(Operator):
 
         # Get active provider
         prefs = None
-        for name in ["blender_ai_nodes", "ai_nodes", __package__]:
+        for name in ["ai_nodes", __package__]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -666,25 +737,8 @@ class NEURO_OT_translate_text(Operator):
         active_provider = prefs.active_provider if prefs else 'google'
 
         # Select fast/cheap model per provider
-        provider_models = {
-            'google': 'gemini-3-flash-preview',
-            'aiml': 'gpt-5-nano-aiml',
-            'replicate': 'gpt-5-nano-repl',
-        }
-
-        # Fal fallback - check text source settings (priority: AIML > Replicate > Google)
-        if active_provider == 'fal':
-            if prefs and getattr(prefs, 'fal_text_from_aiml', False) and api_keys.get("aiml", ""):
-                model_id = 'gpt-5-nano-aiml'
-            elif prefs and getattr(prefs, 'fal_text_from_replicate', False) and api_keys.get("replicate", ""):
-                model_id = 'gpt-5-nano-repl'
-            elif prefs and getattr(prefs, 'fal_text_from_google', False) and api_keys.get("google", ""):
-                model_id = 'gemini-3-flash-preview'
-            else:
-                self.report({'ERROR'}, "Fal has no text models. Enable AIML or Replicate in Providers.")
-                return {'CANCELLED'}
-        else:
-            model_id = provider_models.get(active_provider, 'gemini-3-flash-preview')
+        from .model_registry import resolve_model
+        model_id = resolve_model("text-gpt-nano", context=context)
 
         prompt = f"Translate the following text to English. Output ONLY the translated text, nothing else:\n\n{input_text}"
 
@@ -716,7 +770,7 @@ class NEURO_OT_translate_text(Operator):
         threading.Thread(target=translate_worker, daemon=True).start()
 
         # Show which model is being used
-        model_display = model_id.replace('-aiml', '').replace('-repl', '').replace('-preview', '')
+        model_display = model_id.replace('-repl', '').replace('-preview', '')
         self.report({'INFO'}, f"Translating via {model_display}...")
         return {'FINISHED'}
 
@@ -740,7 +794,7 @@ class NEURO_OT_copy_translation(Operator):
 
 
 class NEURO_FH_drop_images(FileHandler):
-    """File handler for dropping images into AINodes node editor"""
+    """File handler for dropping images into Neuro node editor"""
     bl_idname = "NEURO_FH_drop_images"
     bl_label = "Drop Images to Nodes"
     bl_import_operator = "neuro.drop_images"
@@ -748,7 +802,7 @@ class NEURO_FH_drop_images(FileHandler):
 
     @classmethod
     def poll_drop(cls, context):
-        """Check if we're in a AINodes node editor"""
+        """Check if we're in a Neuro node editor"""
         return (context.area and context.area.type == 'NODE_EDITOR' and
                 context.space_data and hasattr(context.space_data, 'tree_type') and
                 context.space_data.tree_type == 'NeuroGenNodeTree' and
@@ -772,6 +826,18 @@ def register_keymaps():
 
         # New: Ctrl+B to paste reference node at mouse position
         kmi = km.keymap_items.new('neuro.paste_reference_node', 'B', 'PRESS', ctrl=True)
+        addon_keymaps.append((km, kmi))
+
+        # Double-click to view node image
+        kmi = km.keymap_items.new('neuro.node_double_click_view', 'LEFTMOUSE', 'DOUBLE_CLICK')
+        addon_keymaps.append((km, kmi))
+
+        # Enter to generate on active Tripo node
+        kmi = km.keymap_items.new('tripo.enter_generate', 'RET', 'PRESS')
+        addon_keymaps.append((km, kmi))
+
+        # Shift+RMouse: add reroute with same-source merging
+        kmi = km.keymap_items.new('neuro.add_reroute_merged', 'RIGHTMOUSE', 'PRESS', shift=True)
         addon_keymaps.append((km, kmi))
 
 

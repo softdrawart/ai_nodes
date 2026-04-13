@@ -2,28 +2,46 @@
 import os
 import json
 import bpy
+import time as _time
 from bpy.props import StringProperty, IntProperty
 from bpy.types import NodeTree, Node, NodeSocket
 from .utils import get_preview_collection
+from .constants import LOG_PREFIX
 
 _background_timer_running = False
 _force_update_interval = 2.0  # seconds
 
+
+def _auto_select_on_type(self, context):
+    """StringProperty update callback: auto-select the node when user starts typing in its text field."""
+    if not (context.space_data and hasattr(context.space_data, 'node_tree')):
+        return
+    ntree = context.space_data.node_tree
+    if ntree and ntree.nodes.active is not self:
+        for n in ntree.nodes:
+            n.select = False
+        self.select = True
+        ntree.nodes.active = self
+
+
+_sync_neuro_paths_cache = None      # set of paths
+_sync_neuro_paths_cache_time = 0.0
+_SYNC_PATHS_CACHE_TTL = 10.0
+
 # Image sync timer for auto-pack support
 _image_sync_timer_running = False
-_image_sync_interval = 1.5  # seconds
+_image_sync_interval = 3  # seconds
 
 
 def _image_sync_timer():
     """
     Background timer that syncs dirty/packed images to disk.
-    This enables auto-preview updates when user edits images with auto-pack enabled.
-    Only syncs images that are likely from AI Nodes (in generations folder or node paths).
+    OPTIMIZED: caches neuro path set, skips work when nothing dirty.
     """
-    global _image_sync_timer_running
+    global _image_sync_timer_running, _sync_neuro_paths_cache, _sync_neuro_paths_cache_time
 
     try:
-        # First check if there are any AINodes node trees - skip if not
+        # Quick check: any Neuro trees at all?
         has_neuro_trees = any(
             ng.bl_idname == 'NeuroGenNodeTree'
             for ng in bpy.data.node_groups
@@ -31,23 +49,34 @@ def _image_sync_timer():
         if not has_neuro_trees:
             return _image_sync_interval
 
-        # Collect all image paths used by AI Nodes
-        neuro_image_paths = set()
-        for ng in bpy.data.node_groups:
-            if ng.bl_idname == 'NeuroGenNodeTree':
-                for node in ng.nodes:
-                    # Get paths from various node types
-                    if hasattr(node, 'result_path') and node.result_path:
-                        neuro_image_paths.add(os.path.normpath(os.path.abspath(node.result_path)))
-                    if hasattr(node, 'get_image_path'):
-                        try:
-                            path = node.get_image_path()
-                            if path:
-                                neuro_image_paths.add(os.path.normpath(os.path.abspath(path)))
-                        except Exception:
-                            pass
-                    if hasattr(node, 'image_path') and node.image_path:
-                        neuro_image_paths.add(os.path.normpath(os.path.abspath(node.image_path)))
+        # Quick check: any dirty images at all? Skip heavy work if not.
+        has_dirty = any(img.is_dirty for img in bpy.data.images
+                        if img.filepath and not img.filepath.startswith('<'))
+        if not has_dirty:
+            return _image_sync_interval
+
+        # Rebuild neuro path set with TTL cache (every 10s instead of every 1.5s)
+        now = _time.monotonic()
+        if _sync_neuro_paths_cache is None or (now - _sync_neuro_paths_cache_time) > _SYNC_PATHS_CACHE_TTL:
+            neuro_image_paths = set()
+            for ng in bpy.data.node_groups:
+                if ng.bl_idname == 'NeuroGenNodeTree':
+                    for node in ng.nodes:
+                        if hasattr(node, 'result_path') and node.result_path:
+                            neuro_image_paths.add(os.path.normpath(os.path.abspath(node.result_path)))
+                        if hasattr(node, 'get_image_path'):
+                            try:
+                                path = node.get_image_path()
+                                if path:
+                                    neuro_image_paths.add(os.path.normpath(os.path.abspath(path)))
+                            except Exception:
+                                pass
+                        if hasattr(node, 'image_path') and node.image_path:
+                            neuro_image_paths.add(os.path.normpath(os.path.abspath(node.image_path)))
+            _sync_neuro_paths_cache = neuro_image_paths
+            _sync_neuro_paths_cache_time = now
+        else:
+            neuro_image_paths = _sync_neuro_paths_cache
 
         if not neuro_image_paths:
             return _image_sync_interval
@@ -55,8 +84,9 @@ def _image_sync_timer():
         synced_any = False
 
         for img in bpy.data.images:
-            # Skip images without filepath
             if not img.filepath or img.filepath.startswith('<'):
+                continue
+            if not img.is_dirty:
                 continue
 
             try:
@@ -64,33 +94,29 @@ def _image_sync_timer():
             except Exception:
                 continue
 
-            # Only sync if this image is used by a AINodes node
             if abs_path not in neuro_image_paths:
                 continue
 
-            # Check if image needs syncing
-            if not img.is_dirty:
-                continue
-
             try:
-                # Save the image to disk
                 img.save()
                 synced_any = True
 
-                # Clear the preview cache for this path
+                # Invalidate file stat cache for this path
+                NeuroNodeBase.invalidate_file_cache(abs_path)
+
+                # Clear preview cache for this path
                 if node_preview_collection:
-                    keys_to_remove = [k for k in list(node_preview_collection.keys())
-                                      if k.startswith(abs_path)]
+                    old_key_prefix = abs_path + ":"
+                    keys_to_remove = [k for k in node_preview_collection.keys()
+                                      if k.startswith(old_key_prefix)]
                     for key in keys_to_remove:
                         try:
                             del node_preview_collection[key]
                         except Exception:
                             pass
-
             except Exception:
-                pass  # Silently fail
+                pass
 
-        # If we synced anything, trigger redraw
         if synced_any:
             try:
                 for window in bpy.context.window_manager.windows:
@@ -101,9 +127,9 @@ def _image_sync_timer():
                 pass
 
     except Exception:
-        pass  # Timer must not raise
+        pass
 
-    return _image_sync_interval  # Keep running
+    return _image_sync_interval
 
 
 def start_image_sync_timer():
@@ -222,7 +248,9 @@ class NeuroImageSocket(NodeSocket):
     image_path: StringProperty(name="Image Path", default="")
 
     def draw(self, context, layout, node, text):
-        layout.label(text=text)
+        count = len(self.links)
+        label = f"{text} ({count})" if count > 0 else text
+        layout.label(text=label)
 
     def draw_color(self, context, node):
         return (0.4, 0.8, 0.4, 1.0)  # Green
@@ -274,10 +302,16 @@ class HistoryMixin:
     """
 
     def get_history_list(self):
-        """Get image history as list of dicts"""
+        """Get image history as list of dicts (cached — avoids JSON parse every frame)"""
         try:
-            history = getattr(self, 'image_history', '[]')
-            return json.loads(history) if history else []
+            raw = getattr(self, 'image_history', '[]')
+            # Check if raw string changed since last parse
+            if hasattr(self, '_hist_cache_raw') and self._hist_cache_raw == raw:
+                return self._hist_cache
+            result = json.loads(raw) if raw else []
+            self._hist_cache = result
+            self._hist_cache_raw = raw
+            return result
         except Exception:
             return []
 
@@ -329,6 +363,89 @@ class NeuroNodeBase:
     """Base mixin for all AI Nodes"""
     _failed_previews = set()
 
+    # === PERFORMANCE: Cached file stat for draw code ===
+    _file_stat_cache = {}  # {path: (exists, mtime, cache_time)}
+    _FILE_STAT_TTL = 2.0  # seconds
+
+    # === PERFORMANCE: Cached bpy.data.texts lookups ===
+    _text_block_cache = {}  # {text_name: (exists, cache_time)}
+    _TEXT_BLOCK_TTL = 2.0
+
+    @staticmethod
+    def _text_block_exists_cached(text_name):
+        """Cached bpy.data.texts lookup — avoids dict scan every frame."""
+        import bpy as _bpy
+        now = _time.monotonic()
+        cached = NeuroNodeBase._text_block_cache.get(text_name)
+        if cached and (now - cached[1]) < NeuroNodeBase._TEXT_BLOCK_TTL:
+            return cached[0]
+        exists = text_name in _bpy.data.texts
+        NeuroNodeBase._text_block_cache[text_name] = (exists, now)
+        return exists
+
+    def _get_cached_config(self):
+        """Cached get_model() for draw — avoids registry lookup every frame."""
+        model = getattr(self, 'model', '')
+        if not model:
+            return None
+        if getattr(self, '_config_cache_key', None) == model:
+            return getattr(self, '_config_cache', None)
+        from .model_registry import get_model
+        config = get_model(model)
+        try:
+            self._config_cache = config
+            self._config_cache_key = model
+        except AttributeError:
+            pass
+        return config
+
+    @staticmethod
+    def _path_exists_cached(path):
+        """Cached os.path.exists() — avoids syscall every frame per node."""
+        if not path:
+            return False
+        now = _time.monotonic()
+        cached = NeuroNodeBase._file_stat_cache.get(path)
+        if cached and (now - cached[2]) < NeuroNodeBase._FILE_STAT_TTL:
+            return cached[0]
+        exists = os.path.exists(path)
+        mtime = 0
+        if exists:
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                pass
+        NeuroNodeBase._file_stat_cache[path] = (exists, mtime, now)
+        return exists
+
+    @staticmethod
+    def _get_file_mtime_cached(path):
+        """Cached os.path.getmtime() — uses same cache as _path_exists_cached."""
+        if not path:
+            return 0
+        now = _time.monotonic()
+        cached = NeuroNodeBase._file_stat_cache.get(path)
+        if cached and (now - cached[2]) < NeuroNodeBase._FILE_STAT_TTL:
+            return cached[1]
+        # Cache miss — populate
+        exists = os.path.exists(path)
+        mtime = 0
+        if exists:
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                pass
+        NeuroNodeBase._file_stat_cache[path] = (exists, mtime, now)
+        return mtime
+
+    @staticmethod
+    def invalidate_file_cache(path=None):
+        """Invalidate after generation completes or image saved."""
+        if path:
+            NeuroNodeBase._file_stat_cache.pop(path, None)
+        else:
+            NeuroNodeBase._file_stat_cache.clear()
+
     @classmethod
     def poll(cls, ntree):
         return ntree.bl_idname == 'NeuroGenNodeTree'
@@ -341,20 +458,14 @@ class NeuroNodeBase:
     def draw_preview(self, layout, image_path):
         global node_preview_collection
 
-        if not image_path or not os.path.exists(image_path):
+        if not image_path or not self._path_exists_cached(image_path):
             return False
 
         abs_path = os.path.normpath(os.path.abspath(image_path))
 
-        # NOTE: Auto-sync of dirty/packed images is handled by the background timer
-        # (_image_sync_timer). Do NOT do file I/O here - it blocks the UI thread.
-
-        # Include file modification time in key to auto-invalidate on file change
-        try:
-            mtime = os.path.getmtime(image_path)
-            key = f"{abs_path}:{mtime}"
-        except OSError:
-            key = abs_path
+        # Use cached mtime instead of syscall every frame
+        mtime = self._get_file_mtime_cached(image_path)
+        key = f"{abs_path}:{mtime}" if mtime else abs_path
 
         if abs_path in NeuroNodeBase._failed_previews:
             box = layout.box()
@@ -369,14 +480,31 @@ class NeuroNodeBase:
                 return False
 
         if key not in node_preview_collection:
-            # Clean up old previews for this path (different mtime)
-            old_keys = [k for k in node_preview_collection.keys() if k.startswith(abs_path + ":")]
+            # Quick PNG validity check before passing to Blender's libpng loader.
+            # A corrupt IDAT causes libpng to print errors to console and can freeze
+            # Blender on startup when the .blend stores a path to a failed generation.
+            if image_path.lower().endswith('.png'):
+                try:
+                    from PIL import Image as _PV
+                    with _PV.open(image_path) as _v:
+                        _v.load()
+                except Exception as _ve:
+                    print(f"[{LOG_PREFIX}] Skipping corrupt PNG preview ({_ve}): {image_path}")
+                    NeuroNodeBase._failed_previews.add(abs_path)
+                    box = layout.box()
+                    box.label(text="Corrupt image", icon='ERROR')
+                    return False
+
+            # Clean up old keys for this path — but only check keys with matching prefix
+            # This avoids the O(all_previews) scan every frame
+            old_key_prefix = abs_path + ":"
+            old_keys = [k for k in node_preview_collection.keys()
+                        if k.startswith(old_key_prefix) and k != key]
             for old_key in old_keys:
-                if old_key != key:
-                    try:
-                        del node_preview_collection[old_key]
-                    except Exception:
-                        pass
+                try:
+                    del node_preview_collection[old_key]
+                except Exception:
+                    pass
 
             try:
                 node_preview_collection.load(key, image_path, 'IMAGE')
@@ -460,7 +588,7 @@ class NeuroNodeBase:
         """
         is_processing = getattr(self, 'is_processing', False) or getattr(self, 'is_generating', False)
         result_path = getattr(self, 'result_path', '')
-        has_result = result_path and os.path.exists(result_path)
+        has_result = result_path and self._path_exists_cached(self.result_path)
 
         row = layout.row(align=True)
         row.scale_y = 1.15

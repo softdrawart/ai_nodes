@@ -12,6 +12,7 @@ from bpy.types import Operator
 from .utils import (
     refresh_previews_and_collections, get_preview_collection
 )
+from .constants import LOG_PREFIX
 
 
 # =============================================================================

@@ -22,9 +22,7 @@ except ImportError:
 
 def log_node_generation(node_type, model_id, prompt, input_images=None, params=None, provider=None):
     """Log detailed node generation info for debugging"""
-    log_verbose("=" * 60, "Node Gen")
-    log_verbose(f"Node Type: {node_type}", "Node Gen")
-    log_verbose(f"Model: {model_id}", "Node Gen")
+    log_verbose(f"[{node_type}]: {model_id} - START", "Node Gen")
     if provider:
         log_verbose(f"Provider: {provider}", "Node Gen")
     log_verbose(f"Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}", "Node Gen")
@@ -34,13 +32,12 @@ def log_node_generation(node_type, model_id, prompt, input_images=None, params=N
             log_verbose(f"  [{i + 1}] {os.path.basename(img)}", "Node Gen")
     if params:
         log_verbose(f"Parameters: {params}", "Node Gen")
-    log_verbose("=" * 60, "Node Gen")
 
 
-def log_node_result(node_type, success, result_path=None, error=None, duration=None):
+def log_node_result(node_type, model_id, success, result_path=None, error=None, duration=None):
     """Log node generation result"""
     status = "SUCCESS" if success else "FAILED"
-    log_verbose(f"[{node_type}] {status}", "Node Gen")
+    log_verbose(f"[{node_type}]: {model_id} - {status}", "Node Gen")
     if result_path:
         log_verbose(f"  Output: {os.path.basename(result_path)}", "Node Gen")
     if error:
@@ -113,7 +110,6 @@ def run_node_worker(ntree_name, node_name, work_func, on_complete, log_type=None
             if tree:
                 node = tree.nodes.get(node_name)
                 if node:
-                    # Handle cancellation
                     if cancel_event.is_set():
                         if hasattr(node, 'is_processing'):
                             node.is_processing = False
@@ -123,6 +119,11 @@ def run_node_worker(ntree_name, node_name, work_func, on_complete, log_type=None
                             node.status_message = "Cancelled"
                     else:
                         on_complete(node, result, error_msg, duration)
+                        # === PERF: Invalidate file cache after result_path may have changed ===
+                        from .nodes_core import NeuroNodeBase
+                        rp = getattr(node, 'result_path', '')
+                        if rp:
+                            NeuroNodeBase.invalidate_file_cache(rp)
             return None
 
         bpy.app.timers.register(update, first_interval=0.1)
@@ -157,65 +158,11 @@ def get_node_tree(context, tree_name_prop):
 
 
 def get_artist_tool_model(context, tool_type):
-    """
-    Get the appropriate model ID for artist tools based on current provider.
-
-    Args:
-        context: Blender context
-        tool_type: 'text' (describe), 'nano' (change angle), 'pro' (upscale/variations/multiview)
-
-    Returns:
-        model_id: The model ID to use
-    """
-    # Get addon preferences
-    prefs = None
-    # Use generic package lookup to avoid circular imports
-    for name in ["blender_ai_nodes", "ai_nodes", __package__]:
-        if name and name in context.preferences.addons:
-            prefs = context.preferences.addons[name].preferences
-            break
-
-    active_provider = prefs.active_provider if prefs else 'replicate'
-
-    # Get available API keys to check fallbacks
-    google_key, fal_key, replicate_key, aiml_key = get_api_keys(context)
-
-    if tool_type == 'text':
-        # Text models for describe/analyze
-        if active_provider == 'google':
-            return "gemini-3-pro-preview"
-        elif active_provider == 'aiml':
-            return "gemini-3-pro-aiml"
-        elif active_provider == 'fal':
-            # Fal doesn't have text models, fallback to Google
-            if google_key:
-                return "gemini-3-pro-preview"
-            else:
-                return "gemini-3-pro-preview"  # Will fail but at least try
-        else:  # replicate
-            return "gemini-3-pro-repl"
-
-    elif tool_type == 'nano':
-        # Nano Banana (change angle, keep/delete)
-        if active_provider == 'google':
-            return "gemini-2.5-flash-image"
-        elif active_provider == 'aiml':
-            return "nano-banana-aiml"
-        elif active_provider == 'fal':
-            return "nano-banana-fal"
-        else:  # replicate
-            return "nano-banana-repl"
-
-    elif tool_type == 'pro':
-        # Nano Banana Pro (upscale, variations, multiview)
-        if active_provider == 'google':
-            return "gemini-3-pro-image-preview"
-        elif active_provider == 'aiml':
-            return "nano-banana-pro-aiml"
-        elif active_provider == 'fal':
-            return "nano-banana-pro-fal"
-        else:  # replicate
-            return "nano-banana-pro-repl"
-
-    # Default fallback
-    return "nano-banana-pro-aiml"
+    from .model_registry import resolve_model
+    canonical_map = {
+        'text': 'text-gemini-pro',
+        'nano': 'nano-banana-mini',
+        'pro':  'nano-banana-pro',
+    }
+    canonical = canonical_map.get(tool_type, 'nano-banana-pro')
+    return resolve_model(canonical, context=context)

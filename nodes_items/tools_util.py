@@ -24,10 +24,21 @@ class NeuroRemoveBackgroundNode(HistoryMixin, NeuroNodeBase, Node):
     is_processing: BoolProperty(name="Is Processing", default=False)
     status_message: StringProperty(name="Status", default="")
     result_path: StringProperty(name="Result Path", default="")
+    is_generating: BoolProperty(name="Is Generating", default=False)
 
     # Image history
     image_history: StringProperty(name="Image History", default="[]")
     history_index: IntProperty(name="History Index", default=0, min=0)
+
+    use_inpaint: bpy.props.BoolProperty(
+        name="Inpaint",
+        description="When enabled, generation only affects the purple-painted area. "
+                    "Paint the zone first using Open Paint, then enable this toggle",
+        default=False,
+    )
+
+    # PrePaint backup path
+    prepaint_backup: StringProperty(name="PrePaint Backup", default="")
 
     def init(self, context):
         self.is_processing = False
@@ -68,7 +79,7 @@ class NeuroRemoveBackgroundNode(HistoryMixin, NeuroNodeBase, Node):
 
     def draw_buttons(self, context, layout):
         # Show preview with history navigation if we have result
-        if self.result_path and os.path.exists(self.result_path):
+        if self.result_path and self._path_exists_cached(self.result_path):
             self._draw_preview_with_nav(layout)
 
         # Main action button
@@ -79,7 +90,7 @@ class NeuroRemoveBackgroundNode(HistoryMixin, NeuroNodeBase, Node):
             row.operator("neuro.node_rembg_cancel", text="Cancel", icon='CANCEL').node_name = self.name
         else:
             # View full image button
-            if self.result_path and os.path.exists(self.result_path):
+            if self.result_path and self._path_exists_cached(self.result_path):
                 op = row.operator("neuro.node_view_full_image", text="", icon='FULLSCREEN_ENTER')
                 op.image_path = self.result_path
 
@@ -115,9 +126,27 @@ class NeuroRemoveBackgroundNode(HistoryMixin, NeuroNodeBase, Node):
 
         # --- ADDED: COPY BUTTON ---
         if len(history) > 0:
-            col.separator()
+            col.separator(factor=1.5)
+            op = col.operator("neuro.node_open_paint_smart", text="", icon='BRUSH_DATA')
+            op.node_name = self.name
+
+            if self.prepaint_backup and self._path_exists_cached(self.prepaint_backup):
+                col.separator(factor=0.5)
+                op = col.operator("neuro.node_revert_paint", text="", icon='LOOP_BACK')
+                op.node_name = self.name
+
+            col.separator(factor=0.5)
+            op = col.operator("neuro.node_create_inpaint", text="", icon='CLIPUV_HLT')
+            op.node_name = self.name
+
+            col.separator(factor=2)
             op = col.operator("neuro.node_copy_image_file", text="", icon='COPYDOWN')
             op.image_path = self.result_path
+
+            # Add to shader
+            col.separator(factor=2)
+            op = col.operator("neuro.add_to_shader", text="", icon='NODE_MATERIAL')
+            op.node_name = self.name
 
     def draw_label(self):
         if self.is_processing:
@@ -127,6 +156,112 @@ class NeuroRemoveBackgroundNode(HistoryMixin, NeuroNodeBase, Node):
         if self.result_path:
             return "BG Removed!"
         return "Remove Background"
+
+
+# =============================================================================
+# PHOTOSHOP BRIDGE NODE
+# =============================================================================
+
+class NeuroPSBridgeNode(NeuroNodeBase, Node):
+    """Bridge node for round-tripping images through Adobe Photoshop"""
+    bl_idname = 'NeuroPSBridgeNode'
+    bl_label = 'Photoshop'
+    bl_icon = 'IMAGE_DATA'
+    bl_width_default = 260
+    bl_width_min = 200
+
+    result_path: StringProperty(name="Result Path", default="")
+    status_message: StringProperty(name="Status", default="")
+    is_processing: BoolProperty(name="Is Processing", default=False)
+
+    use_inpaint: BoolProperty(
+        name="Inpaint",
+        description="When enabled, generation only affects the purple-painted area. "
+                    "Paint the zone first using Open Paint, then enable this toggle",
+        default=False,
+    )
+    prepaint_backup: StringProperty(name="PrePaint Backup", default="")
+
+    def init(self, context):
+        self.inputs.new('NeuroImageSocket', "Image")
+        self.outputs.new('NeuroImageSocket', "Image")
+
+    def copy(self, node):
+        self.result_path = ""
+        self.status_message = ""
+
+    def get_input_image(self):
+        """Get connected input image path"""
+        if "Image" in self.inputs and self.inputs["Image"].is_linked:
+            for link in self.inputs["Image"].links:
+                if hasattr(link.from_node, 'get_image_path'):
+                    try:
+                        path = link.from_node.get_image_path(link.from_socket.name)
+                    except TypeError:
+                        path = link.from_node.get_image_path()
+                    if path and os.path.exists(path):
+                        return path
+                if hasattr(link.from_node, 'result_path') and link.from_node.result_path:
+                    if os.path.exists(link.from_node.result_path):
+                        return link.from_node.result_path
+        return None
+
+    def get_image_path(self, socket_name=None):
+        """Return result_path for downstream nodes; falls back to input image."""
+        if self.result_path and os.path.exists(self.result_path):
+            return self.result_path
+        return self.get_input_image()
+
+    def draw_buttons(self, context, layout):
+        display_path = self.result_path if (self.result_path and os.path.exists(self.result_path)) else self.get_input_image()
+
+        if display_path and self._path_exists_cached(display_path):
+            row = layout.row(align=True)
+            self.draw_preview(row, display_path)
+
+            col = row.column(align=True)
+            col.ui_units_x = 1.0
+
+            op = col.operator("neuro.node_open_paint_smart", text="", icon='BRUSH_DATA')
+            op.node_name = self.name
+
+            if self.prepaint_backup and self._path_exists_cached(self.prepaint_backup):
+                col.separator(factor=0.5)
+                op = col.operator("neuro.node_revert_paint", text="", icon='LOOP_BACK')
+                op.node_name = self.name
+
+            col.separator(factor=0.5)
+            op = col.operator("neuro.node_create_inpaint", text="", icon='CLIPUV_HLT')
+            op.node_name = self.name
+
+            col.separator(factor=2)
+            op = col.operator("neuro.node_copy_image_file", text="", icon='COPYDOWN')
+            op.image_path = display_path
+
+            col.separator(factor=0.5)
+            op = col.operator("neuro.add_to_shader", text="", icon='NODE_MATERIAL')
+            op.node_name = self.name
+
+            col.separator(factor=0.5)
+            op = col.operator("neuro.node_remove_bg", text="", icon='IMAGE_RGB_ALPHA')
+            op.node_name = self.name
+        else:
+            box = layout.box()
+            box.scale_y = 1.5
+            box.label(text="Connect image input", icon='IMAGE_DATA')
+
+        row = layout.row(align=True)
+        row.scale_y = 1.15
+        op = row.operator("neuro.ps_edit", text="Edit in PS", icon='GREASEPENCIL')
+        op.node_name = self.name
+        op = row.operator("neuro.ps_grab", text="Grab from PS", icon='IMPORT')
+        op.node_name = self.name
+
+        if self.status_message:
+            layout.label(text=self.status_message)
+
+    def draw_label(self):
+        return "Photoshop"
 
 
 # =============================================================================
@@ -220,9 +355,13 @@ class NeuroImageSplitterNode(NeuroNodeBase, Node):
         """Return image path for specified output socket"""
         paths = {
             "Front": self.front_path,
+            "A": self.front_path,
             "Left": self.left_path,
+            "B": self.left_path,
             "Right": self.right_path,
+            "C": self.right_path,
             "Back": self.back_path,
+            "D": self.back_path,
         }
         if output_name and output_name in paths:
             path = paths[output_name]
@@ -239,19 +378,27 @@ class NeuroImageSplitterNode(NeuroNodeBase, Node):
             # 2x2 Preview grid
             self._draw_preview_grid(layout)
 
+            # Determine button labels based on mode
+            if self.splitter_mode == 'UNIVERSAL':
+                label_tl, label_tr = "A", "C"
+                label_bl, label_br = "B", "D"
+            else:
+                label_tl, label_tr = "Front", "Right"
+                label_bl, label_br = "Left", "Back"
+
             # 2x2 View buttons matching grid layout
             row = layout.row(align=True)
             row.scale_y = 1.1
-            op = row.operator("neuro.node_view_full_image", text="Front", icon='NONE')
+            op = row.operator("neuro.node_view_full_image", text=label_tl, icon='NONE')
             op.image_path = self.front_path
-            op = row.operator("neuro.node_view_full_image", text="Right", icon='NONE')
+            op = row.operator("neuro.node_view_full_image", text=label_tr, icon='NONE')
             op.image_path = self.right_path
 
             row = layout.row(align=True)
             row.scale_y = 1.1
-            op = row.operator("neuro.node_view_full_image", text="Left", icon='NONE')
+            op = row.operator("neuro.node_view_full_image", text=label_bl, icon='NONE')
             op.image_path = self.left_path
-            op = row.operator("neuro.node_view_full_image", text="Back", icon='NONE')
+            op = row.operator("neuro.node_view_full_image", text=label_br, icon='NONE')
             op.image_path = self.back_path
         else:
             # Main split button
@@ -280,7 +427,7 @@ class NeuroImageSplitterNode(NeuroNodeBase, Node):
         # Fix imports for subdirectory structure
         from ..nodes_core import node_preview_collection
 
-        if not image_path or not os.path.exists(image_path):
+        if not image_path or not self._path_exists_cached(image_path):
             layout.label(text="", icon='IMAGE_DATA')
             return
 

@@ -6,7 +6,7 @@ from bpy.props import StringProperty
 from bpy.types import Operator
 
 from .utils import get_all_api_keys, get_api_keys, cancel_event, get_fal_text_provider, get_text_api_key_for_fal
-from .constants import CREATIVE_UPGRADE_PROMPT, EDITING_UPGRADE_PROMPT, EDITING_UPGRADE_PROMPT_LOOSE
+from .constants import CREATIVE_UPGRADE_PROMPT, EDITING_UPGRADE_PROMPT, EDITING_UPGRADE_PROMPT_LOOSE, LOG_PREFIX, ADDON_NAME_CONFIG
 from .nodes_ops_common import get_node_tree
 
 
@@ -60,6 +60,14 @@ class NEURO_OT_node_generate_text(Operator):
         except Exception:
             pass
 
+        job_id = None
+        try:
+            from . import status_manager
+            job_id = status_manager.add_job(prompt[:30], model, "Text Gen")
+            status_manager.start_job(job_id)
+        except ImportError:
+            pass
+
         def worker():
             res = None
             error_msg = None
@@ -69,6 +77,17 @@ class NEURO_OT_node_generate_text(Operator):
             except Exception as e:
                 error_msg = str(e)[:100]
                 print(f"[{LOG_PREFIX}] Text gen error: {e}")
+
+            # Update status manager
+            if job_id:
+                try:
+                    from . import status_manager as sm
+                    if res:
+                        sm.complete_job(job_id, success=True)
+                    else:
+                        sm.complete_job(job_id, success=False, error=error_msg)
+                except Exception:
+                    pass
 
             def update():
                 tree = bpy.data.node_groups.get(ntree_name)
@@ -118,7 +137,7 @@ class NEURO_OT_node_upgrade_prompt(Operator):
 
         # Get the active provider
         prefs = None
-        for name in [__package__, "blender_ai_nodes", "ai_nodes"]:
+        for name in [__package__, "ai_nodes"]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -134,38 +153,17 @@ class NEURO_OT_node_upgrade_prompt(Operator):
                 return {'CANCELLED'}
             active_provider = text_provider  # Use the fallback provider
 
-        # Map node.model base to provider-specific model ID
-        # Model IDs follow pattern: {base}-{provider_suffix}
-        model_base = node.model.lower() if node.model else ""
-
-        # Detect base model type from the selected model
-        if "gemini-3-flash" in model_base:
-            base = "gemini-3-flash"
-        elif "gemini-3-pro" in model_base:
-            base = "gemini-3-pro"
-        elif "gpt-5-nano" in model_base:
-            base = "gpt-5-nano"
-        elif "gpt-5.1" in model_base:
-            base = "gpt-5.1"
-        elif "gpt-5.2" in model_base:
-            base = "gpt-5.2"
+        # Resolve model_id via registry reverse-lookup (future-proof for any GPT version)
+        from .model_registry import UNIFIED_MODELS, resolve_model as _resolve
+        selected = (node.model or "").lower()
+        canonical = next(
+            (c for c, variants in UNIFIED_MODELS.items() if selected in variants.values()),
+            None
+        )
+        if canonical:
+            model_id = _resolve(canonical, context=context)
         else:
-            base = "gemini-3-pro"  # Default
-
-        # Build provider-specific model ID
-        provider_suffix = {
-            'aiml': '-aiml',
-            'replicate': '-repl',
-            'google': '-preview' if base.startswith('gemini') else '-repl',
-        }
-
-        if active_provider == 'google' and base.startswith('gemini'):
-            model_id = f"{base}-preview"
-        elif active_provider == 'google' and base.startswith('gpt'):
-            # Google doesn't have GPT models, use gemini instead
-            model_id = "gemini-3-pro-preview"
-        else:
-            model_id = f"{base}{provider_suffix.get(active_provider, '-aiml')}"
+            model_id = _resolve("text-gemini-pro", context=context)
 
         templates = {'CREATIVE': CREATIVE_UPGRADE_PROMPT, 'EDITING': EDITING_UPGRADE_PROMPT,
                      'EDITING_LOOSE': EDITING_UPGRADE_PROMPT_LOOSE}
@@ -181,15 +179,28 @@ class NEURO_OT_node_upgrade_prompt(Operator):
         model_params = {}
         if config and config.params:
             for param in config.params:
-                model_params[param.name] = param.default
+                prop_name = f"param_{param.name}"
+                if hasattr(node, prop_name):
+                    model_params[param.name] = getattr(node, prop_name)
+                else:
+                    model_params[param.name] = param.default
 
         node.is_processing = True
         node.is_upgrading = True
         node.status_message = f"Upgrading via {active_provider}..."
         node_name, ntree_name = node.name, ntree.name
 
+        job_id = None
+        try:
+            from . import status_manager
+            job_id = status_manager.add_job(prompt[:30], model_id, "Upgrade Prompt")
+            status_manager.start_job(job_id)
+        except ImportError:
+            pass
+
         def worker():
             res = None
+            error_msg = None
             try:
                 res = generate_text(
                     prompt=full_prompt,
@@ -200,7 +211,18 @@ class NEURO_OT_node_upgrade_prompt(Operator):
                     timeout=60
                 )
             except Exception as e:
+                error_msg = str(e)[:100]
                 print(f"[{LOG_PREFIX}] Prompt upgrade error: {e}")
+
+            if job_id:
+                try:
+                    from . import status_manager as sm
+                    if res:
+                        sm.complete_job(job_id, success=True)
+                    else:
+                        sm.complete_job(job_id, success=False, error=error_msg)
+                except Exception:
+                    pass
 
             def update():
                 tree = bpy.data.node_groups.get(ntree_name)
@@ -211,7 +233,7 @@ class NEURO_OT_node_upgrade_prompt(Operator):
                         n.output_prompt = res
                         n.status_message = "Upgraded!"
                     else:
-                        n.status_message = "Failed"
+                        n.status_message = f"Failed: {error_msg}" if error_msg else "Failed"
                 return None
 
             bpy.app.timers.register(update, first_interval=0.1)
@@ -248,7 +270,7 @@ class NEURO_OT_node_show_prompt(Operator):
         l.label(text=self.title, icon='TEXT')
         l.separator()
         box = l.box()
-        wrapper = textwrap.TextWrapper(width=70)
+        wrapper = textwrap.TextWrapper(width=86)
         for line in self.prompt_text.split('\n'):
             for w in wrapper.wrap(line) if line else [""]: box.label(text=w)
         l.separator()
@@ -319,4 +341,38 @@ class NEURO_OT_sync_text_to_node(Operator):
         else:
             self.report({'WARNING'}, "Text block not found")
 
+        return {'FINISHED'}
+
+
+class NEURO_OT_paste_to_node(Operator):
+    """Paste clipboard text into node property (preserves newlines)"""
+    bl_idname = "neuro.paste_to_node"
+    bl_label = "Paste"
+    bl_description = "Paste from clipboard (preserves multi-line text)"
+    node_name: StringProperty()
+    prop_name: StringProperty(default="prompt")
+
+    def execute(self, context):
+        ntree = get_node_tree(context, None)
+        if not ntree: return {'CANCELLED'}
+        node = ntree.nodes.get(self.node_name)
+        if not node: return {'CANCELLED'}
+
+        clipboard = context.window_manager.clipboard
+        if not clipboard:
+            self.report({'WARNING'}, "Clipboard is empty")
+            return {'CANCELLED'}
+
+        # Set property programmatically — bypasses single-line widget stripping
+        setattr(node, self.prop_name, clipboard)
+
+        # Also update the text block if it exists
+        text_name = f"Node_{node.name}_{self.prop_name}"
+        if text_name in bpy.data.texts:
+            bpy.data.texts[text_name].clear()
+            bpy.data.texts[text_name].write(clipboard)
+
+        line_count = clipboard.count('\n') + 1
+        char_count = len(clipboard)
+        self.report({'INFO'}, f"Pasted {char_count} chars ({line_count} lines)")
         return {'FINISHED'}

@@ -12,6 +12,10 @@ from collections import deque
 from datetime import datetime
 import threading
 import json
+import time as _time
+
+from .constants import LOG_PREFIX,PANELS_NAME
+from .config.proxy import _PROXY_BASE_ERROR
 
 # =============================================================================
 # GLOBALS
@@ -202,7 +206,33 @@ def get_error_count():
 # =============================================================================
 
 _redraw_timer_running = False
+_cached_status_bar_data = None
+_cached_status_bar_time = 0.0
+_STATUS_BAR_CACHE_TTL = 0.5  # seconds
 
+def get_status_bar_data():
+    """Combined getter for status bar — single lock, 0.5s cache.
+    Returns dict with 'running', 'queued', 'error_count', 'last_error'."""
+    global _cached_status_bar_data, _cached_status_bar_time
+
+    now = _time.monotonic()
+    if _cached_status_bar_data and (now - _cached_status_bar_time) < _STATUS_BAR_CACHE_TTL:
+        return _cached_status_bar_data
+
+    with _lock:
+        data = {
+            "running": _current_status.get("running", 0),
+            "queued": _current_status.get("queued", 0),
+            "completed_session": _current_status.get("completed_session", 0),
+            "failed_session": _current_status.get("failed_session", 0),
+            "last_model": _current_status.get("last_model", ""),
+            "last_error": _current_status.get("last_error", ""),
+            "error_count": len(_error_log),
+        }
+
+    _cached_status_bar_data = data
+    _cached_status_bar_time = now
+    return data
 
 def _trigger_redraw():
     """Schedule a UI redraw (called from main thread only)."""
@@ -214,13 +244,16 @@ def _redraw_timer():
     """Timer callback to handle UI redraws safely from main thread."""
     global _needs_redraw, _redraw_timer_running
 
-    if _needs_redraw:
+    has_running = _current_status.get("running", 0) > 0
+
+    if _needs_redraw or has_running:
         _needs_redraw = False
         try:
             for window in bpy.context.window_manager.windows:
                 for area in window.screen.areas:
-                    # Only redraw status bar to avoid UI freeze
                     if area.type == 'STATUSBAR':
+                        area.tag_redraw()
+                    elif area.type == 'NODE_EDITOR':
                         area.tag_redraw()
         except Exception:
             pass
@@ -244,56 +277,60 @@ def draw_status_bar(self, context):
 
         # --- PART 1: PROVIDER STATUS (First) ---
         try:
-            prefs = None
-            # Robust preference lookup
-            for name in [__package__, "blender_ai_nodes", "ai_nodes"]:
-                if name and name in ctx.preferences.addons:
-                    addon = ctx.preferences.addons[name]
-                    if addon:
-                        prefs = addon.preferences
-                        break
+            # Check NeuroToken mode
+            _nt_active = False
+            try:
+                from .token_utils import is_nt_active
+                _nt_active = is_nt_active()
+            except ImportError:
+                pass
 
-            if prefs:
-                scn = ctx.scene
-                active_provider = getattr(prefs, 'active_provider', 'aiml')
-                keys_checked = getattr(scn, 'neuro_keys_checked', False)
+            if _nt_active:
+                is_internal_build = False
+                try:
+                    from .config import is_internal
+                    is_internal_build = is_internal()
+                except Exception:
+                    pass
 
-                # Map provider id → API key property name on prefs
-                _KEY_PROPS = {
-                    "aiml": "aiml_api_key",
-                    "google": "gemini_api_key",
-                    "replicate": "replicate_api_key",
-                    "fal": "fal_api_key",
-                }
+                # NeuroToken mode — show single indicator instead of provider icons
+                sub = row.row(align=True)
+                sub.alert = True
+                if is_internal_build:
+                    sub.label(text="Proxy Server", icon='FUND')
+                else:
+                    sub.label(text="NeuroToken", icon='FUND')
+            else:
+                # Normal mode — show provider icons
+                from .utils import get_addon_name
+                addon_name = get_addon_name()
+                if addon_name and addon_name in context.preferences.addons:
+                    prefs = context.preferences.addons[addon_name].preferences
+                    scn = context.scene
+                    active_provider = prefs.active_provider
 
-                def draw_prov_icon(p_row, name, enabled_prop, status_attr, prov_id):
-                    if not getattr(prefs, enabled_prop, False):
-                        return
+                    def draw_prov_icon(parent, name, pref_attr, status_attr, prov_id):
+                        if not getattr(prefs, pref_attr, False):
+                            return
+                        p_row = parent.row(align=True)
 
-                    # Check if key exists in prefs (persists across files)
-                    key_prop = _KEY_PROPS.get(prov_id, "")
-                    has_key = bool(getattr(prefs, key_prop, "").strip()) if key_prop else False
+                        status_val = getattr(scn, status_attr, "unknown")
+                        if status_val == "connected":
+                            icon = 'CHECKMARK'
+                        elif status_val == "error":
+                            icon = 'ERROR'
+                        else:
+                            icon = 'CHECKMARK'
 
-                    if not has_key:
-                        icon = 'QUESTION'  # No key entered at all
-                    elif keys_checked:
-                        # API verification ran — use verified result
-                        status_val = getattr(scn, status_attr, False)
-                        icon = 'CHECKMARK' if status_val else 'ERROR'
-                    else:
-                        # Key present but not yet verified
-                        icon = 'CHECKMARK'
+                        sub = p_row.row(align=True)
+                        if active_provider == prov_id:
+                            sub.alert = True
+                        sub.label(text=name, icon=icon)
+                        p_row.separator()
 
-                    sub = p_row.row(align=True)
-                    if active_provider == prov_id:
-                        sub.alert = True
-                    sub.label(text=name, icon=icon)
-                    p_row.separator()
-
-                draw_prov_icon(row, "AIML", "provider_aiml_enabled", "neuro_aiml_status", "aiml")
-                draw_prov_icon(row, "Google", "provider_google_enabled", "neuro_google_status", "google")
-                draw_prov_icon(row, "Rep", "provider_replicate_enabled", "neuro_replicate_status", "replicate")
-                draw_prov_icon(row, "Fal", "provider_fal_enabled", "neuro_fal_status", "fal")
+                    draw_prov_icon(row, "Google", "provider_google_enabled", "neuro_google_status", "google")
+                    draw_prov_icon(row, "Rep", "provider_replicate_enabled", "neuro_replicate_status", "replicate")
+                    draw_prov_icon(row, "Fal", "provider_fal_enabled", "neuro_fal_status", "fal")
 
         except Exception as e:
             pass
@@ -305,9 +342,9 @@ def draw_status_bar(self, context):
 
         # --- PART 2: QUEUE STATUS (Second) ---
         try:
-            status = get_status()
-            running = status.get("running", 0)
-            error_count = get_error_count()
+            sbd = get_status_bar_data()
+            running = sbd["running"]
+            error_count = sbd["error_count"]
 
             sub = row.row(align=True)
             if running > 0:
@@ -316,7 +353,7 @@ def draw_status_bar(self, context):
             else:
                 sub.label(text="[ Idle ]")
         except Exception as e:
-            pass
+            error_count = 0
 
         # --- PART 3: ERRORS (Last) ---
         try:
@@ -477,7 +514,7 @@ class NEURO_OT_show_errors_popup(bpy.types.Operator):
         return {'FINISHED'}
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_popup(self, width=400)
+        return context.window_manager.invoke_props_dialog(self, width=400, title="Errors")
 
     def draw(self, context):
         layout = self.layout
@@ -514,8 +551,7 @@ class NEURO_OT_show_errors_popup(bpy.types.Operator):
         row.operator("neuro.clear_errors", text="Clear All", icon='X')
 
     def cancel(self, context):
-        # Clear errors when popup is closed
-        clear_errors()
+        pass  # Don't auto-clear — user clicks "Clear All" explicitly
 
 
 class NEURO_OT_clear_errors(bpy.types.Operator):
@@ -570,9 +606,12 @@ class NEURO_OT_send_error_report(bpy.types.Operator):
             try:
                 data = json.dumps(report).encode("utf-8")
                 req = urllib.request.Request(
-                    "https://api.neuronodes.io/v1/error/report",
+                    _PROXY_BASE_ERROR,
                     data=data,
-                    headers={"Content-Type": "application/json"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "Mozilla/5.0 (Compatible; Addon)"
+                    },
                     method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=10) as resp:
@@ -582,6 +621,9 @@ class NEURO_OT_send_error_report(bpy.types.Operator):
                             return None
                         bpy.app.timers.register(_ok, first_interval=0.1)
                         print(f"[{LOG_PREFIX}] Error report sent ({len(errors)} errors)")
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode("utf-8", errors="ignore")
+                print(f"[{LOG_PREFIX}] Failed to send error report: {e.code} - {error_body}")
             except Exception as e:
                 print(f"[{LOG_PREFIX}] Failed to send error report: {e}")
 
@@ -633,6 +675,113 @@ class NEURO_OT_send_error_report(bpy.types.Operator):
             "errors": formatted,
         }
 
+class NEURO_OT_send_feedback(bpy.types.Operator):
+    """Send feedback message to developers"""
+    bl_idname = "neuro.send_feedback"
+    bl_label = "Send Feedback"
+    bl_options = {'REGISTER'}
+
+    feedback_text: bpy.props.StringProperty(
+        name="Message",
+        description="Your feedback (max 500 characters)",
+        default="",
+        maxlen=500,
+    )
+
+    _last_sent_date = ""  # Class-level: 1 per day
+
+    @classmethod
+    def poll(cls, context):
+        from datetime import date
+        return cls._last_sent_date != str(date.today())
+
+    def invoke(self, context, event):
+        self.feedback_text = ""
+        return context.window_manager.invoke_props_dialog(self, width=400, title="Send Feedback")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Write your feedback or suggestion:")
+        layout.prop(self, "feedback_text", text="")
+
+    def execute(self, context):
+        import threading
+
+        text = self.feedback_text.strip()
+        if not text:
+            self.report({'WARNING'}, "Feedback message is empty")
+            return {'CANCELLED'}
+
+        report = self._build_payload(text)
+
+        def send_worker():
+            import urllib.request
+            import urllib.error
+
+            try:
+                data = json.dumps(report).encode("utf-8")
+                req = urllib.request.Request(
+                    _PROXY_BASE_ERROR,
+                    data=data,
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "Mozilla/5.0 (Compatible; Addon)"
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status == 200:
+                        from datetime import date
+                        def _ok():
+                            NEURO_OT_send_feedback._last_sent_date = str(date.today())
+                            return None
+                        bpy.app.timers.register(_ok, first_interval=0.1)
+                        print(f"[{LOG_PREFIX}] Feedback sent")
+            except Exception as e:
+                print(f"[{LOG_PREFIX}] Failed to send feedback: {e}")
+
+        threading.Thread(target=send_worker, daemon=True).start()
+        self.report({'INFO'}, "Sending feedback...")
+        return {'FINISHED'}
+
+    def _build_payload(self, text):
+        import platform
+        import hashlib
+
+        addon_version = "unknown"
+        try:
+            import sys
+            root = __package__.split(".")[0] if __package__ else ""
+            pkg = sys.modules.get(root)
+            if pkg and hasattr(pkg, "bl_info"):
+                v = pkg.bl_info.get("version", (0, 0, 0))
+                addon_version = ".".join(map(str, v))
+        except Exception:
+            pass
+
+        try:
+            import uuid
+            parts = [platform.node(), str(uuid.getnode()), platform.machine(), platform.system()]
+            machine_hash = hashlib.sha256(":".join(parts).encode()).hexdigest()[:16]
+        except Exception:
+            machine_hash = "unknown"
+
+        from datetime import datetime
+        return {
+            "addon_version": addon_version,
+            "blender_version": bpy.app.version_string,
+            "os": f"{platform.system()} {platform.release()}",
+            "machine_id": machine_hash,
+            "error_count": 1,
+            "errors": [{
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "node": "",
+                "model": "FEEDBACK",
+                "message": text[:500],
+            }],
+        }
+
+
 # =============================================================================
 # REGISTRATION
 # =============================================================================
@@ -644,6 +793,7 @@ classes = [
     NEURO_OT_show_errors_popup,
     NEURO_OT_clear_errors,
     NEURO_OT_send_error_report,
+    NEURO_OT_send_feedback,
     NEURO_OT_clear_completed_jobs,
 ]
 

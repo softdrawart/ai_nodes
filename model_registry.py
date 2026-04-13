@@ -42,7 +42,7 @@ class Provider(Enum):
     FAL = "fal"  # Fal.AI (backup)
     REPLICATE = "replicate"  # Replicate.ai (primary alternative)
     TRIPO = "tripo"  # Tripo 3D mesh generation
-    AIML = "aiml"  # AIML API (unified access to multiple models)
+    OPENAI = "openai"  # Direct OpenAI API (GPT models via NeuroToken)
 
 
 class ModelCategory(Enum):
@@ -173,6 +173,11 @@ class ModelConfig:
     supports_batch: bool = True
     max_batch_size: int = 4
     supports_streaming: bool = False
+
+    # Image input config - how the API expects input images
+    # Each model defines its own param name and whether it takes array or single
+    image_param_name: str = "image"  # API field name for image input
+    image_as_array: bool = False  # True = send as list, False = send first image only
 
     # Size/Resolution
     size_param_name: str = "image_size"
@@ -362,7 +367,7 @@ class ModelRegistry:
             gpt-image-1.5-fal -> gpt-image-1.5
         """
         # Remove known provider suffixes
-        for suffix in ["-google", "-fal", "-replicate"]:
+        for suffix in ["-google", "-fal", "-replicate", "-oai"]:
             if model_id.endswith(suffix):
                 return model_id[:-len(suffix)]
         return model_id
@@ -677,6 +682,143 @@ class ProviderHandler:
 
 # Provider handler registry (for future use)
 _provider_handlers: Dict[Provider, type] = {}
+
+# =============================================================================
+# UNIFIED MODEL RESOLVER
+# =============================================================================
+# Central mapping: canonical name → provider-specific model ID
+# Eliminates scattered model_map dicts across nodes/operators.
+# When a model becomes obsolete, change ONE line here.
+#
+# Usage:  model_id = resolve_model("nano-banana", context=context)
+#         model_id = resolve_model("nano-banana-pro")  # auto-detects provider
+#         model_id = resolve_model("text-gemini-pro", provider="neurotoken")
+
+UNIFIED_MODELS = {
+    # ── IMAGE: Nano Banana Mini (fast, gemini-2.5-flash-image) ──
+    "nano-banana-mini": {
+        "google": "nano-banana-mini-google",
+        "fal": "nano-banana-mini-fal",
+        "replicate": "nano-banana-mini-repl",
+    },
+    # ── IMAGE: Nano Banana (default, gemini-3.1-flash-image) ──
+    "nano-banana": {
+        "google": "nano-banana-google",
+        "fal": "nano-banana-fal",
+        "replicate": "nano-banana-repl",
+    },
+    # ── IMAGE: Nano Banana Pro (complex, gemini-3-pro-image) ──
+    "nano-banana-pro": {
+        "google": "nano-banana-pro-google",
+        "fal": "nano-banana-pro-fal",
+        "replicate": "nano-banana-pro-repl",
+    },
+    # ── IMAGE: GPT Image (gpt-image-1) ──
+    "gpt-image": {
+        "openai": "gpt-image-oai",
+    },
+    # ── IMAGE: GPT Image Mini (gpt-image-1-mini) ──
+    "gpt-image-mini": {
+        "openai": "gpt-image-mini-oai",
+    },
+    # ── IMAGE: GPT Image Pro (gpt-image-1.5) ──
+    "gpt-image-pro": {
+        "openai": "gpt-image-pro-oai",
+    },
+    # ── IMAGE: Grok Imagen ──
+    "grok-imagen": {
+        "fal": "grok-imagen-fal",
+        "replicate": "grok-imagen-repl",
+    },
+    # ── IMAGE: Flux 2 Pro ──
+    "flux2-pro": {
+        "fal": "flux2-pro-fal",
+        "replicate": "flux2-pro-repl",
+    },
+
+    # ── TEXT: Gemini 3 Flash ──
+    "text-gemini-flash": {
+        "google": "gemini-3-flash-google",
+        "replicate": "gemini-3-flash-repl",
+    },
+    # ── TEXT: Gemini 3 Pro ──
+    "text-gemini-pro": {
+        "google": "gemini-3-pro-google",
+        "replicate": "gemini-3-pro-repl",
+    },
+    # ── TEXT: Claude Sonnet 4.5 ──
+    "text-claude-sonnet": {
+        "replicate": "claude-sonnet-4-5-repl",
+    },
+    # ── TEXT: Claude Opus 4.6 ──
+    "text-claude-opus": {
+        "replicate": "claude-opus-4-6-repl",
+    },
+    # ── TEXT: GPT Nano (fast/cheap, gpt-5-nano) ──
+    "text-gpt-nano": {
+        "openai": "text-gpt-nano-oai",
+    },
+    # ── TEXT: GPT (gpt-5.2) ──
+    "text-gpt": {
+        "openai": "text-gpt-oai",
+    },
+    # ── TEXT: GPT Latest (gpt-5.4) ──
+    "text-gpt-latest": {
+        "openai": "text-gpt-latest-oai",
+    },
+    # ── UTILITY ──
+    "birefnet": {
+        "fal": "birefnet-fal",
+        "replicate": "birefnet-repl",
+    },
+}
+
+
+def resolve_model(canonical, provider=None, context=None):
+    """
+    Resolve a canonical model name to provider-specific model_id.
+
+    In neurotoken mode, auto-derives the best worker-routable variant
+    (no manual "neurotoken" entries needed in UNIFIED_MODELS).
+
+    Args:
+        canonical: Canonical name (e.g. "nano-banana-pro", "text-gemini-pro")
+        provider: Override provider (e.g. "google", "fal")
+        context: Blender context (for auto-detecting active provider)
+
+    Returns:
+        Provider-specific model_id string
+    """
+    variants = UNIFIED_MODELS.get(canonical)
+    if not variants:
+        # Not a canonical name — return as-is (direct model_id)
+        return canonical
+
+    # Determine effective provider
+    if provider is None:
+        # Check neurotoken mode first
+        try:
+            from .token_utils import is_nt_active, resolve_nt_variant
+            if is_nt_active():
+                nt_id = resolve_nt_variant(canonical, variants)
+                if nt_id:
+                    return nt_id
+        except ImportError:
+            pass
+
+        provider = get_active_provider(context) if context else "google"
+
+    # Try exact provider, then fallback chain
+    if provider in variants:
+        return variants[provider]
+
+    # Fallback: google → replicate → fal → first available
+    for fallback in ("google", "replicate", "fal"):
+        if fallback in variants:
+            return variants[fallback]
+
+    # Last resort: first value
+    return next(iter(variants.values()))
 
 
 def register_provider_handler(provider: Provider, handler_class: type):

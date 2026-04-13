@@ -15,10 +15,12 @@ from . import nodes_ops
 from . import nodes_utils_ops
 from . import nodes_text_ops
 from . import nodes_tools_ops
+from . import nodes_ops_quick
 from . import nodes_ui
 from . import nodes_3d
 from . import nodes_geo
 from .nodes_core import stop_background_timer, start_image_sync_timer, stop_image_sync_timer
+from .constants import LOG_PREFIX
 
 # Status manager (optional - graceful fallback if missing)
 try:
@@ -27,6 +29,24 @@ try:
     HAS_STATUS_MANAGER = True
 except ImportError:
     HAS_STATUS_MANAGER = False
+
+# Team nodes (internal builds only — not shipped in commercial)
+HAS_TEAM = False
+try:
+    from .config import is_internal
+    if is_internal():
+        from . import nodes_team
+        HAS_TEAM = True
+except (ImportError, Exception):
+    pass
+
+# Neuro nodes (designing nodes — graceful if package missing)
+HAS_NEURO = False
+try:
+    from . import nodes_neuro
+    HAS_NEURO = True
+except (ImportError, Exception):
+    pass
 
 # List of classes to register from submodules
 CLASSES = [
@@ -51,6 +71,7 @@ CLASSES = [
     # Utils
     tools_util.NeuroImageSplitterNode,
     tools_util.NeuroRemoveBackgroundNode,
+    tools_util.NeuroPSBridgeNode,
 
     # Base Generation Ops (from nodes_ops)
     nodes_ops.NEURO_OT_node_generate,
@@ -73,17 +94,21 @@ CLASSES = [
     nodes_text_ops.NEURO_OT_node_show_prompt,
     nodes_text_ops.NEURO_OT_open_text_editor,
     nodes_text_ops.NEURO_OT_sync_text_to_node,
+    nodes_text_ops.NEURO_OT_paste_to_node,
 
     # Utility Ops (from nodes_utils_ops)
     nodes_utils_ops.NEURO_OT_refresh_node_preview,
     nodes_utils_ops.NEURO_OT_node_history_nav,
     nodes_utils_ops.NEURO_OT_node_view_full_image,
+    nodes_utils_ops.NEURO_OT_node_double_click_view,
+    nodes_utils_ops.NEURO_OT_node_open_paint_smart,
     nodes_utils_ops.NEURO_OT_node_open_paint,
     nodes_utils_ops.NEURO_OT_node_revert_paint,
     nodes_utils_ops.NEURO_OT_node_toggle_inpaint,
     nodes_utils_ops.NEURO_OT_node_copy_image_file,
     nodes_utils_ops.NEURO_OT_node_load_file,
     nodes_utils_ops.NEURO_OT_node_load_files_multi,
+    nodes_utils_ops.NEURO_OT_node_ref_navigate,
     nodes_utils_ops.NEURO_OT_node_ref_clear,
     nodes_utils_ops.NEURO_OT_node_from_editor,
     nodes_utils_ops.NEURO_OT_node_load_blender_image,
@@ -95,6 +120,10 @@ CLASSES = [
     nodes_utils_ops.NEURO_OT_node_export,
     nodes_utils_ops.NEURO_OT_node_import,
     nodes_utils_ops.NEURO_OT_node_manual,
+    nodes_utils_ops.NEURO_OT_ps_edit,
+    nodes_utils_ops.NEURO_OT_ps_grab,
+    nodes_utils_ops.NEURO_OT_add_to_shader,
+    nodes_utils_ops.NEURO_OT_add_reroute_merged,
 
     # Artist Tools Ops (from nodes_tools_ops)
     nodes_tools_ops.NEURO_OT_node_artist_describe,
@@ -132,6 +161,10 @@ CLASSES = [
     nodes_tools_ops.NEURO_OT_node_relight_load_ref,
     nodes_tools_ops.NEURO_OT_node_relight_select_ref,
     nodes_tools_ops.NEURO_OT_node_relight_clear_refs,
+    nodes_tools_ops.NEURO_OT_node_relight_neutral,
+
+    # QuickTools header popover
+    *nodes_ops_quick.CLASSES,
 
     # Nodes editor UI
     nodes_ui.NEURO_MT_node_add,
@@ -173,6 +206,14 @@ def register():
     # 3. Register 3D nodes
     nodes_3d.register()
 
+    # 3b. Register Team nodes (internal only)
+    if HAS_TEAM:
+        nodes_team.register()
+
+    # 3c. Register Neuro nodes (designing package)
+    if HAS_NEURO:
+        nodes_neuro.register()
+
     # 4. UI and Keymaps
     bpy.types.NODE_HT_header.append(nodes_ui.draw_neuro_header)
     bpy.types.NODE_MT_add.append(nodes_ui.draw_node_add_menu)
@@ -184,11 +225,14 @@ def register():
 
     nodes_ui.register_keymaps()
 
-    # 5. Status Manager
+    # 5. QuickTools wm property
+    nodes_ops_quick.register()
+
+    # 6. Status Manager
     if HAS_STATUS_MANAGER:
         status_manager.register()
 
-    # 6. Start image sync timer for auto-pack support
+    # 7. Start image sync timer for auto-pack support
     start_image_sync_timer()
 
 
@@ -213,8 +257,27 @@ def unregister():
     bpy.types.NODE_MT_add.remove(nodes_ui.draw_node_add_menu)
     bpy.types.NODE_HT_header.remove(nodes_ui.draw_neuro_header)
 
+    # Unregister Team nodes (internal only)
+    if HAS_TEAM:
+        try:
+            nodes_team.unregister()
+        except Exception:
+            pass
+
+    # Unregister Neuro nodes (commercial designing package)
+    if HAS_NEURO:
+        try:
+            nodes_neuro.unregister()
+        except Exception:
+            pass
+
     # Unregister 3D nodes
     nodes_3d.unregister()
+
+    try:
+        nodes_ops_quick.unregister()
+    except Exception:
+        pass
 
     for cls in reversed(CLASSES):
         try:

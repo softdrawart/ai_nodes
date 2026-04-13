@@ -7,7 +7,7 @@ Property groups and scene property registration.
 import bpy
 
 from .constants import (
-    ASPECT_RATIOS, STYLE_OPTIONS, LIGHTING_ITEMS, MODIFIERS_MAP
+    ASPECT_RATIOS, STYLE_OPTIONS, LIGHTING_ITEMS, MODIFIERS_MAP, ADDON_NAME_CONFIG
 )
 
 
@@ -61,7 +61,7 @@ def _get_disabled_models(context):
     """Get set of disabled model IDs from preferences"""
     import json
     prefs = None
-    for name in ["blender_ai_nodes", "ai_nodes", __package__]:
+    for name in ["ai_nodes", __package__]:
         if name and name in context.preferences.addons:
             prefs = context.preferences.addons[name].preferences
             break
@@ -100,18 +100,30 @@ def get_generation_models(self, context):
 
     Supports adding models from secondary providers based on preferences:
     - Fal + fal_include_google_models → add Google models
-    - AIML + aiml_include_google_models → add Google models
     - Google + google_include_fal_models → add Fal models
     - Replicate + replicate_include_google_models → add Google models
+    - NeuroToken mode → auto-derived from UNIFIED_MODELS
     """
     try:
         from .model_registry import get_registry, ModelCategory, Provider
 
         registry = get_registry()
 
+        # --- NeuroToken mode: derive from UNIFIED_MODELS ---
+        try:
+            from .token_utils import get_nt_enum_items
+            nt_items = get_nt_enum_items("image")
+            if nt_items:
+                disabled = _get_disabled_models(context)
+                filtered = _filter_disabled(nt_items, disabled)
+                if filtered:
+                    return filtered
+        except ImportError:
+            pass
+
         # Get active provider from preferences
         prefs = None
-        for name in ["blender_ai_nodes", "ai_nodes", __package__]:
+        for name in ["ai_nodes", __package__]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -119,12 +131,11 @@ def get_generation_models(self, context):
         if prefs and hasattr(prefs, 'active_provider'):
             active = prefs.active_provider
             provider_map = {
-                'aiml': Provider.AIML,
                 'replicate': Provider.REPLICATE,
                 'google': Provider.GOOGLE,
                 'fal': Provider.FAL,
             }
-            provider = provider_map.get(active, Provider.AIML)
+            provider = provider_map.get(active, Provider.GOOGLE)
 
             items = registry.get_models_for_active_provider(
                 category=ModelCategory.IMAGE_GENERATION,
@@ -134,16 +145,6 @@ def get_generation_models(self, context):
 
             # Fal + Google models option
             if active == 'fal' and getattr(prefs, 'fal_include_google_models', False):
-                google_items = registry.get_models_for_active_provider(
-                    category=ModelCategory.IMAGE_GENERATION,
-                    active_provider=Provider.GOOGLE
-                )
-                if google_items:
-                    items.append(("_google_separator", "-- Google Models --", ""))
-                    items.extend(google_items)
-
-            # AIML + Google models option
-            elif active == 'aiml' and getattr(prefs, 'aiml_include_google_models', False):
                 google_items = registry.get_models_for_active_provider(
                     category=ModelCategory.IMAGE_GENERATION,
                     active_provider=Provider.GOOGLE
@@ -202,17 +203,30 @@ def get_text_models(self, context):
     """Dynamic getter for text models from registry - uses active provider.
 
     Special handling for Fal provider: Since Fal has no LLM capabilities,
-    uses the configured text source (AIML or Replicate, mutually exclusive).
+    uses the configured text source (Replicate or Google).
     Google models can be added alongside any text source.
+    NeuroToken mode auto-derives from UNIFIED_MODELS.
     """
     try:
         from .model_registry import get_registry, ModelCategory, Provider
 
         registry = get_registry()
 
+        # --- NeuroToken mode: derive from UNIFIED_MODELS ---
+        try:
+            from .token_utils import get_nt_enum_items
+            nt_items = get_nt_enum_items("text")
+            if nt_items:
+                disabled = _get_disabled_models(context)
+                filtered = _filter_disabled(nt_items, disabled)
+                if filtered:
+                    return filtered
+        except ImportError:
+            pass
+
         # Get active provider from preferences
         prefs = None
-        for name in ["blender_ai_nodes", "ai_nodes", __package__]:
+        for name in ["ai_nodes", __package__]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -226,19 +240,13 @@ def get_text_models(self, context):
                 text_provider = None
                 items = []
 
-                # Priority 1: AIML if enabled (conflicts with Replicate)
-                if getattr(prefs, 'fal_text_from_aiml', False):
-                    aiml_key = getattr(prefs, 'aiml_api_key', '')
-                    if aiml_key:
-                        text_provider = Provider.AIML
-
-                # Priority 2: Replicate if enabled and AIML not selected
-                if not text_provider and getattr(prefs, 'fal_text_from_replicate', False):
+                # Priority 1: Replicate if enabled
+                if getattr(prefs, 'fal_text_from_replicate', False):
                     replicate_key = getattr(prefs, 'replicate_api_key', '')
                     if replicate_key:
                         text_provider = Provider.REPLICATE
 
-                # Legacy fallback: fal_text_from_google for backward compatibility
+                # Priority 2: Google if enabled
                 if not text_provider and getattr(prefs, 'fal_text_from_google', False):
                     google_key = getattr(prefs, 'gemini_api_key', '')
                     if google_key:
@@ -251,8 +259,7 @@ def get_text_models(self, context):
                     )
                     items = list(items) if items else []
 
-                # Add Google models if include option enabled (doesn't conflict)
-                # Skip if Google is already the main text provider
+                # Add Google models if include option enabled
                 if text_provider != Provider.GOOGLE and getattr(prefs, 'fal_include_google_models', False):
                     google_key = getattr(prefs, 'gemini_api_key', '')
                     if google_key:
@@ -270,16 +277,15 @@ def get_text_models(self, context):
 
                 # No text source configured - return empty with warning
                 return [("none", "No LLM Source (Configure in Settings)",
-                         "Fal has no LLM. Enable AIML or Replicate in Settings.")]
+                         "Fal has no LLM. Enable Replicate in Settings.")]
 
             # Normal provider handling
             provider_map = {
-                'aiml': Provider.AIML,
                 'replicate': Provider.REPLICATE,
                 'google': Provider.GOOGLE,
                 'fal': Provider.FAL,
             }
-            provider = provider_map.get(active, Provider.AIML)
+            provider = provider_map.get(active, Provider.GOOGLE)
 
             items = registry.get_models_for_active_provider(
                 category=ModelCategory.TEXT_GENERATION,
@@ -287,18 +293,8 @@ def get_text_models(self, context):
             )
             items = list(items) if items else []
 
-            # AIML + Google text models option
-            if active == 'aiml' and getattr(prefs, 'aiml_include_google_models', False):
-                google_items = registry.get_models_for_active_provider(
-                    category=ModelCategory.TEXT_GENERATION,
-                    active_provider=Provider.GOOGLE
-                )
-                if google_items:
-                    items.append(("_google_text_separator", "-- Google LLMs --", ""))
-                    items.extend(google_items)
-
             # Replicate + Google text models option
-            elif active == 'replicate' and getattr(prefs, 'replicate_include_google_models', False):
+            if active == 'replicate' and getattr(prefs, 'replicate_include_google_models', False):
                 google_items = registry.get_models_for_active_provider(
                     category=ModelCategory.TEXT_GENERATION,
                     active_provider=Provider.GOOGLE
@@ -322,13 +318,13 @@ def get_text_models(self, context):
             return filtered
         # Ultimate fallback
         return [
-            ("gpt-5.1", "GPT-5.1", ""),
+            ("text-gpt-oai", "GPT", ""),
             ("gemini-3-pro-google", "Gemini 3.0 Pro (Google)", ""),
         ]
     except Exception as e:
         print(f"[{ADDON_NAME_CONFIG}] Text model enum error: {e}")
         return [
-            ("gpt-5.1", "GPT-5.1", ""),
+            ("text-gpt-oai", "GPT", ""),
             ("gemini-3-pro-google", "Gemini 3.0 Pro (Google)", ""),
         ]
 
@@ -535,7 +531,7 @@ def register_properties():
     )
 
     # === SETTINGS ===
-    bpy.types.Scene.neuro_timeout = bpy.props.IntProperty(name="Timeout", default=60, min=15, max=300)
+    bpy.types.Scene.neuro_timeout = bpy.props.IntProperty(name="Timeout", default=300, min=30, max=600)
     bpy.types.Scene.neuro_texture_frame_percent = bpy.props.IntProperty(
         name="Texture Frame %", default=99, min=80, max=100)
     bpy.types.Scene.neuro_texture_resolution = bpy.props.EnumProperty(
@@ -552,7 +548,6 @@ def register_properties():
     bpy.types.Scene.neuro_google_status = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.neuro_fal_status = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.neuro_replicate_status = bpy.props.BoolProperty(default=False)
-    bpy.types.Scene.neuro_aiml_status = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.neuro_keys_checked = bpy.props.BoolProperty(default=False)
 
     # === TRIPO 3D ===
@@ -562,10 +557,10 @@ def register_properties():
         default=""
     )
 
-    # === AIML BALANCE ===
-    bpy.types.Scene.aiml_balance = bpy.props.StringProperty(
-        name="AIML Balance",
-        description="Current AIML credit balance",
+    # === NEUROTOKEN BALANCE ===
+    bpy.types.Scene.neurotoken_balance = bpy.props.StringProperty(
+        name="NeuroToken Balance",
+        description="Current NeuroToken credit balance",
         default=""
     )
 
@@ -603,6 +598,20 @@ def register_properties():
     bpy.types.Scene.neuro_show_settings = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.neuro_show_generated = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.neuro_show_textures = bpy.props.BoolProperty(default=True)
+    bpy.types.Scene.neuro_texture_model = bpy.props.EnumProperty(
+        name="Texture Model",
+        items=[
+            ('nano-banana', 'Nano Banana', 'Nano Banana (v2) — fast, balanced quality'),
+            ('nano-banana-pro', 'Banana Pro', 'Nano Banana Pro — highest quality'),
+        ],
+        default='nano-banana',
+    )
+    bpy.types.Scene.neuro_show_merger = bpy.props.BoolProperty(default=False)
+    bpy.types.Scene.neuro_merger_collection = bpy.props.PointerProperty(
+        name="Source Collection",
+        type=bpy.types.Collection,
+        description="Collection to duplicate and merge into a single texture-ready mesh",
+    )
 
     # === STORED SHADING ===
     bpy.types.Scene.neuro_stored_shading_type = bpy.props.StringProperty(default="")
@@ -646,6 +655,9 @@ def unregister_properties():
         'neuro_show_settings',
         'neuro_show_generated',
         'neuro_show_textures',
+        'neuro_texture_model',
+        'neuro_show_merger',
+        'neuro_merger_collection',
         'neuro_stored_shading_type',
         'neuro_stored_shading_light',
         'neuro_stored_studio_light',
@@ -656,11 +668,10 @@ def unregister_properties():
         'neuro_google_status',
         'neuro_fal_status',
         'neuro_replicate_status',
-        'neuro_aiml_status',
         'neuro_keys_checked',
         'neuro_use_thought_signatures',
         'tripo_balance',
-        'aiml_balance',
+        'neurotoken_balance',
         'neuro_translate_input',
         'neuro_translate_result',
         'neuro_upgrade_strict',

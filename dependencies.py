@@ -16,6 +16,8 @@ import threading  # Added for download thread
 
 import bpy
 
+from .constants import LOG_PREFIX
+
 
 # =============================================================================
 # LIBRARY PATH MANAGEMENT
@@ -206,31 +208,30 @@ class DummyTypes:
 
 VERIFIED_PACKAGES = {
     "google-genai": {
-        "version": "1.60.0",
-        "hash": None,
+        "version": "1.71.0",
+        "hash": "6213ebfee7fc8e6a21692c2c340309e463322cc35c2c603d1ea59e8ea34ac240",
     },
     "fal-client": {
-        "version": "0.12.0",
-        "hash": None,
+        "version": "0.13.2",
+        "hash": "1f26efc21067de136026086f44aa32655e457a9a3b67fb20617bba930953d553",
     },
     "replicate": {
         "version": "1.0.7",
         "hash": None,  # Verify via PyPI
     },
     "Pillow": {
-        "version": "12.1.0",
-        "hash": None,  # Platform-specific, verified via PyPI
+        "version": "12.2.0",
+        "hash": "a4e8f36e677d3336f35089648c8955c51c6d386a13cf6ee9c189c5f5bd713a9f",
     },
     "tripo3d": {
-        "version": "0.3.10",
-        "hash": None,  # Verify via PyPI
+        "version": "0.3.12",
+        "hash": "7251e0342946fbe2878b0b8ff70d309749effb17fa1d9619ee6534799603f6d4",
     },
     "aiohttp": {
-        "version": "3.13.3",
-        "hash": None,  # Platform-specific, required by tripo3d
+        "version": "3.13.5",
+        "hash": "02222e7e233295f40e011c1b00e3b0bd451f22cf853a0304c3595633ee47da4b",
     },
 }
-
 
 # =============================================================================
 # SECURITY FUNCTIONS
@@ -335,8 +336,8 @@ class NEURO_OT_install_deps(bpy.types.Operator):
                 layout.label(text="Blender has locked the library files.")
                 layout.separator()
                 layout.label(text="To Force Update:")
-                layout.label(text="1. Close Blender completely.")
-                layout.label(text="2. Delete the 'libs' folder (click below).")
+                layout.label(text="1. Delete the 'libs' folder (click below).")
+                layout.label(text="2. Close Blender completely.")
                 layout.separator()
                 # Added Open Folder button directly in popup
                 layout.operator("neuro.open_libs_folder", text="Open Libs Folder", icon='FILE_FOLDER')
@@ -400,7 +401,7 @@ class NEURO_OT_install_deps(bpy.types.Operator):
         print("[Security] Starting secure package installation...")
 
         # Create temp directory for downloads
-        temp_download_dir = tempfile.mkdtemp(prefix="blender_neuro_nodes_")
+        temp_download_dir = tempfile.mkdtemp(prefix="blender_ai_nodes_")
         verification_results = []
         all_verified = True
 

@@ -7,9 +7,9 @@ from bpy.props import StringProperty, BoolProperty, EnumProperty, IntProperty
 from bpy.types import Node
 
 # Import dependencies from parent modules
-from ..constants import ASPECT_RATIOS, MODIFIERS_MAP
+from ..constants import ASPECT_RATIOS, MODIFIERS_MAP, LOG_PREFIX, ADDON_NAME_CONFIG
 from ..utils import get_model_name_display
-from ..nodes_core import NeuroNodeBase, HistoryMixin
+from ..nodes_core import NeuroNodeBase, HistoryMixin, _auto_select_on_type
 from .. import nodes_core  # Needed for node_preview_collection in Reference Node
 
 # Import dynamic getters from base.py (since you created it)
@@ -33,7 +33,7 @@ class NeuroGenerateNode(NeuroNodeBase, Node):
             self.outputs["History Out"].hide = not show_history
 
     # Core Props
-    prompt: StringProperty(name="Prompt", default="")
+    prompt: StringProperty(name="Prompt", default="", maxlen=0, update=_auto_select_on_type)
     show_settings: BoolProperty(name="Show Settings", default=False)
     show_modifiers: BoolProperty(name="Show Modifiers", default=False)
     model: EnumProperty(name="Model", items=get_node_generation_models, update=update_history_sockets)
@@ -215,7 +215,9 @@ class NeuroGenerateNode(NeuroNodeBase, Node):
     def copy(self, node):
         self.is_generating = False
         self.has_generated = False
+        self.model_used = ""
         self.status_message = ""
+        self.result_path = ""
         self.image_history = "[]"
         self.history_index = 0
         self.conversation_history = "[]"  # Clear conversation history on copy
@@ -254,7 +256,7 @@ class NeuroGenerateNode(NeuroNodeBase, Node):
         return "Generate / Edit"
 
     def draw_buttons(self, context, layout):
-        has_result = bool(self.result_path and os.path.exists(self.result_path))
+        has_result = bool(self.result_path and self._path_exists_cached(self.result_path))
 
         # --- PREVIEW & ACTION COLUMN ---
         if has_result:
@@ -276,10 +278,10 @@ class NeuroGenerateNode(NeuroNodeBase, Node):
                 col.label(text=f"{self.history_index + 1}/{len(history)}")
 
             col.separator(factor=1.5)
-            op = col.operator("neuro.node_open_paint", text="", icon='BRUSH_DATA')
+            op = col.operator("neuro.node_open_paint_smart", text="", icon='BRUSH_DATA')
             op.node_name = self.name
 
-            if self.prepaint_backup and os.path.exists(self.prepaint_backup):
+            if self.prepaint_backup and self._path_exists_cached(self.prepaint_backup):
                 col.separator(factor=0.5)
                 op = col.operator("neuro.node_revert_paint", text="", icon='LOOP_BACK')
                 op.node_name = self.name
@@ -293,9 +295,14 @@ class NeuroGenerateNode(NeuroNodeBase, Node):
             op = col.operator("neuro.node_copy_image_file", text="", icon='COPYDOWN')
             op.image_path = self.result_path
 
+            # Add to shader
+            col.separator(factor=2)
+            op = col.operator("neuro.add_to_shader", text="", icon='NODE_MATERIAL')
+            op.node_name = self.name
+
             if not self.is_generating:
                 col.separator(factor=2)
-                bg_op = col.operator("neuro.node_remove_bg", text="", icon='IMAGE_RGB_ALPHA' )
+                bg_op = col.operator("neuro.node_remove_bg", text="", icon='IMAGE_RGB_ALPHA')
                 bg_op.node_name = self.name
 
         else:
@@ -318,9 +325,12 @@ class NeuroGenerateNode(NeuroNodeBase, Node):
             edit_op = row.operator("neuro.open_text_editor", text="", icon='GREASEPENCIL')
             edit_op.node_name = self.name
             edit_op.prop_name = "prompt"
+            paste_op = row.operator("neuro.paste_to_node", text="", icon='PASTEDOWN')
+            paste_op.node_name = self.name
+            paste_op.prop_name = "prompt"
 
             text_name = f"Node_{self.name}_prompt"
-            if text_name in bpy.data.texts:
+            if self._text_block_exists_cached(text_name):
                 sync_op = row.operator("neuro.sync_text_to_node", text="", icon='FILE_REFRESH')
                 sync_op.node_name = self.name
                 sync_op.prop_name = "prompt"
@@ -374,8 +384,7 @@ class NeuroGenerateNode(NeuroNodeBase, Node):
             box = layout.box()
 
             try:
-                from ..model_registry import get_model
-                config = get_model(self.model)
+                config = self._get_cached_config()
                 if config and config.params:
                     param_names = [p.name for p in config.params]
                     drawn_params = set()
@@ -457,7 +466,7 @@ class NeuroGenerateNode(NeuroNodeBase, Node):
         return base
 
     def get_image_path(self):
-        return self.result_path if self.result_path and os.path.exists(self.result_path) else ""
+        return self.result_path if self.result_path and self._path_exists_cached(self.result_path) else ""
 
     def get_input_images(self):
         images = []
@@ -471,7 +480,12 @@ class NeuroGenerateNode(NeuroNodeBase, Node):
                         if path and os.path.exists(path) and path not in images:
                             images.append(path)
                 elif hasattr(from_node, 'get_image_path'):
-                    path = from_node.get_image_path()
+                    # Tell the node exactly which socket we are connected to!
+                    try:
+                        path = from_node.get_image_path(link.from_socket.name)
+                    except TypeError:
+                        path = from_node.get_image_path()
+
                     if path and os.path.exists(path) and path not in images:
                         images.append(path)
         return images
@@ -509,6 +523,13 @@ class NeuroReferenceNode(NeuroNodeBase, Node):
     grid_columns: IntProperty(name="Grid Columns", default=3, min=2, max=6,
                               description="Number of columns in grid preview")
 
+    use_inpaint: bpy.props.BoolProperty(
+        name="Inpaint",
+        description="When enabled, generation only affects the purple-painted area. "
+                    "Paint the zone first using Open Paint, then enable this toggle",
+        default=False,
+    )
+
     # PrePaint backup path
     prepaint_backup: StringProperty(name="PrePaint Backup", default="")
 
@@ -519,8 +540,7 @@ class NeuroReferenceNode(NeuroNodeBase, Node):
         """Get all image paths as list"""
         try:
             paths = json.loads(self.image_paths_json) if self.image_paths_json else []
-            # Filter to only existing files
-            return [p for p in paths if p and os.path.exists(p)]
+            return [p for p in paths if p and self._path_exists_cached(p)]
         except:
             return []
 
@@ -531,6 +551,10 @@ class NeuroReferenceNode(NeuroNodeBase, Node):
             self.current_index = min(self.current_index, len(paths) - 1)
         else:
             self.current_index = 0
+        # Prime the file stat cache so draw_buttons finds them immediately
+        for p in paths:
+            if p:
+                NeuroNodeBase._file_stat_cache.pop(p, None)
 
     def add_image_path(self, path):
         """Add a single image path"""
@@ -579,12 +603,12 @@ class NeuroReferenceNode(NeuroNodeBase, Node):
         row.prop(self, "source_type", text="")
 
         # Paint Button + Revert (Only show if valid path exists)
-        if current_path and os.path.exists(current_path):
+        if current_path and self._path_exists_cached(current_path):
             row.separator()
-            op = row.operator("neuro.node_open_paint", text="", icon='BRUSH_DATA' )
+            op = row.operator("neuro.node_open_paint_smart", text="", icon='BRUSH_DATA' )
             op.node_name = self.name
             # Revert to backup (only show if backup exists)
-            if self.prepaint_backup and os.path.exists(self.prepaint_backup):
+            if self.prepaint_backup and self._path_exists_cached(self.prepaint_backup):
                 op = row.operator("neuro.node_revert_paint", text="", icon='LOOP_BACK')
                 op.node_name = self.name
             inp = row.operator("neuro.node_create_inpaint", text="", icon='CLIPUV_HLT')
@@ -608,7 +632,7 @@ class NeuroReferenceNode(NeuroNodeBase, Node):
         elif self.source_type == 'RENDER':
             layout.operator("neuro.node_from_render", text="Grab Render", icon='RENDER_STILL').node_name = self.name
 
-        """ 
+        """
         if self.status_message:
             layout.label(text=self.status_message, icon='INFO')
         """
@@ -636,17 +660,14 @@ class NeuroReferenceNode(NeuroNodeBase, Node):
         grid = box.grid_flow(row_major=True, columns=cols, even_columns=True, even_rows=True, align=True)
 
         for i, path in enumerate(paths):
-            if not os.path.exists(path):
+            if not self._path_exists_cached(path):
                 continue
 
             abs_path = os.path.normpath(os.path.abspath(path))
 
             # Generate preview key with mtime
-            try:
-                mtime = os.path.getmtime(path)
-                key = f"{abs_path}:{mtime}"
-            except OSError:
-                key = abs_path
+            mtime = self._get_file_mtime_cached(path)
+            key = f"{abs_path}:{mtime}" if mtime else abs_path
 
             # Load preview if needed
             if key not in preview_collection:
@@ -670,13 +691,13 @@ class NeuroReferenceNode(NeuroNodeBase, Node):
         # Fallback to legacy single-image properties
         if self.source_type == 'FILE' and self.file_path:
             path = bpy.path.abspath(self.file_path)
-            if os.path.exists(path):
+            if self._path_exists_cached(path):
                 return path
         elif self.source_type == 'BLENDER' and self.blender_image:
             img = bpy.data.images.get(self.blender_image)
-            if img and self.image_path and os.path.exists(self.image_path):
+            if img and self.image_path and self._path_exists_cached(self.image_path):
                 return self.image_path
-        return self.image_path if self.image_path and os.path.exists(self.image_path) else ""
+        return self.image_path if self.image_path and self._path_exists_cached(self.image_path) else ""
 
     def get_all_image_paths(self):
         """Get all stored image paths for multi-reference support"""
@@ -702,6 +723,7 @@ class NeuroInpaintNode(NeuroNodeBase, HistoryMixin, Node):
         name="Prompt",
         description="Describe what to generate in the painted zone",
         default="",
+        maxlen=0,
     )
 
     # --- Model toggle ---
@@ -737,10 +759,15 @@ class NeuroInpaintNode(NeuroNodeBase, HistoryMixin, Node):
         self.is_generating = False
         self.status_message = ""
         self.has_generated = False
+        self.result_path = ""
+        self.image_history = "[]"
+        self.history_index = 0
+        self.model_used = ""
+        self.prepaint_backup = ""
 
     def get_image_path(self):
         """For open_paint, revert_paint, remove_bg, view_full operators"""
-        if self.result_path and os.path.exists(self.result_path):
+        if self.result_path and self._path_exists_cached(self.result_path):
             return self.result_path
         return None
 
@@ -751,25 +778,34 @@ class NeuroInpaintNode(NeuroNodeBase, HistoryMixin, Node):
         images = []
 
         # 1. Main image — the painted preview
-        if self.result_path and os.path.exists(self.result_path):
+        if self.result_path and self._path_exists_cached(self.result_path):
             images.append(self.result_path)
 
         # 2. Connected reference images from sockets
         for inp in self.inputs:
             if inp.is_linked and inp.bl_idname == 'NeuroImageSocket':
-                linked_node = inp.links[0].from_node
+                link = inp.links[0]
+                linked_node = link.from_node
                 path = None
-                if hasattr(linked_node, 'result_path') and linked_node.result_path:
+
+                # Try getting the specific socket path first
+                if hasattr(linked_node, 'get_image_path'):
+                    try:
+                        path = linked_node.get_image_path(link.from_socket.name)
+                    except TypeError:
+                        path = linked_node.get_image_path()
+
+                # Fallback to result path
+                if not path and hasattr(linked_node, 'result_path') and linked_node.result_path:
                     path = linked_node.result_path
-                elif hasattr(linked_node, 'get_image_path'):
-                    path = linked_node.get_image_path()
-                if path and os.path.exists(path):
+
+                if path and self._path_exists_cached(path):
                     images.append(path)
 
         return images
 
     def draw_buttons(self, context, layout):
-        has_result = bool(self.result_path and os.path.exists(self.result_path))
+        has_result = bool(self.result_path and self._path_exists_cached(self.result_path))
 
         # --- PREVIEW & ACTION COLUMN ---
         if has_result:
@@ -796,11 +832,11 @@ class NeuroInpaintNode(NeuroNodeBase, HistoryMixin, Node):
 
             # Open Paint
             side_col.separator(factor=1.5)
-            op = side_col.operator("neuro.node_open_paint", text="", icon='BRUSH_DATA')
+            op = side_col.operator("neuro.node_open_paint_smart", text="", icon='BRUSH_DATA')
             op.node_name = self.name
 
             # Revert Paint
-            if self.prepaint_backup and os.path.exists(self.prepaint_backup):
+            if self.prepaint_backup and self._path_exists_cached(self.prepaint_backup):
                 side_col.separator(factor=0.5)
                 op = side_col.operator("neuro.node_revert_paint", text="", icon='LOOP_BACK')
                 op.node_name = self.name
@@ -832,6 +868,9 @@ class NeuroInpaintNode(NeuroNodeBase, HistoryMixin, Node):
         prompt_row = layout.row(align=True)
         prompt_row.prop(self, "prompt", text="")
         op = prompt_row.operator("neuro.open_text_editor", text="", icon='GREASEPENCIL')
+        op.node_name = self.name
+        op.prop_name = "prompt"
+        op = prompt_row.operator("neuro.paste_to_node", text="", icon='PASTEDOWN')
         op.node_name = self.name
         op.prop_name = "prompt"
 

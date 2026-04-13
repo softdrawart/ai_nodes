@@ -17,7 +17,7 @@ from .constants import (
     STYLE_OPTIONS, LIGHTING_ITEMS, MODIFIERS_MAP,
     CREATIVE_UPGRADE_PROMPT, EDITING_UPGRADE_PROMPT, EDITING_UPGRADE_PROMPT_LOOSE,
     DEFAULT_TEXTURE_PROMPT, DEFAULT_TEXTURE_REF_PROMPT,
-    get_presets_file
+    get_presets_file, LOG_PREFIX
 )
 from .utils import (
     get_api_keys, get_all_api_keys, get_generations_folder,
@@ -346,7 +346,7 @@ class NEURO_OT_upgrade_prompt(Operator):
 
         # Get the active provider
         prefs = None
-        for name in [__package__, "blender_ai_nodes", "ai_nodes"]:
+        for name in [__package__, "ai_nodes"]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -366,33 +366,17 @@ class NEURO_OT_upgrade_prompt(Operator):
         else:
             provider_display = active_provider.title()
 
-        # Map selected upgrade model to provider-specific model ID
-        selected_model = scn.neuro_upgrade_model.lower() if scn.neuro_upgrade_model else ""
-
-        # Detect base model type
-        if "gemini-3-flash" in selected_model:
-            base = "gemini-3-flash"
-        elif "gemini-3-pro" in selected_model:
-            base = "gemini-3-pro"
-        elif "gpt-5-nano" in selected_model:
-            base = "gpt-5-nano"
-        elif "gpt-5.1" in selected_model:
-            base = "gpt-5.1"
-        elif "gpt-5.2" in selected_model:
-            base = "gpt-5.2"
+        # Resolve model_id via registry reverse-lookup (future-proof for any GPT version)
+        from .model_registry import UNIFIED_MODELS, resolve_model as _resolve
+        selected_model = (scn.neuro_upgrade_model or "").lower()
+        canonical = next(
+            (c for c, variants in UNIFIED_MODELS.items() if selected_model in variants.values()),
+            None
+        )
+        if canonical:
+            model_id = _resolve(canonical, context=context)
         else:
-            base = "gemini-3-pro"  # Default
-
-        # Build provider-specific model ID
-        if active_provider == 'google' and base.startswith('gemini'):
-            model_id = f"{base}-preview"
-        elif active_provider == 'google' and base.startswith('gpt'):
-            # Google doesn't have GPT models, use gemini instead
-            model_id = "gemini-3-pro-preview"
-        elif active_provider == 'replicate':
-            model_id = f"{base}-repl"
-        else:  # aiml
-            model_id = f"{base}-aiml"
+            model_id = _resolve("text-gemini-pro", context=context)
 
         refs = [r.path for r in scn.neuro_reference_images if os.path.exists(r.path)]
 
@@ -553,6 +537,102 @@ class NEURO_OT_show_full_prompt(Operator):
 
 
 # =============================================================================
+# OBJECT MERGER
+# =============================================================================
+
+class NEURO_OT_merge_for_texture(bpy.types.Operator):
+    """Duplicate collection, convert curves, apply modifiers, strip materials, join into one mesh"""
+    bl_idname = "neuro.merge_for_texture"
+    bl_label = "Merge & Prepare"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    _CONVERTIBLE = {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT'}
+
+    def execute(self, context):
+        scn = context.scene
+        src_col = scn.neuro_merger_collection
+        if not src_col:
+            self.report({'ERROR'}, "No source collection selected")
+            return {'CANCELLED'}
+
+        source_objects = [o for o in src_col.all_objects if o.type in self._CONVERTIBLE]
+        if not source_objects:
+            self.report({'WARNING'}, "No mesh/curve objects found in collection")
+            return {'CANCELLED'}
+
+        col_name = f"{src_col.name}_tex_ready"
+
+        # Remove previous merged collection if it exists
+        if col_name in bpy.data.collections:
+            old_col = bpy.data.collections[col_name]
+            for obj in list(old_col.objects):
+                bpy.data.objects.remove(obj, do_unlink=True)
+            bpy.data.collections.remove(old_col)
+
+        dest_col = bpy.data.collections.new(col_name)
+        context.scene.collection.children.link(dest_col)
+
+        # Hide original collection in viewport so the merged copy is the focus
+        src_col.hide_viewport = True
+
+        # Duplicate objects into the new collection
+        new_objects = []
+        for obj in source_objects:
+            new_obj = obj.copy()
+            new_obj.data = obj.data.copy()
+            dest_col.objects.link(new_obj)
+            new_objects.append(new_obj)
+
+        # Ensure OBJECT mode
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Process each duplicate
+        for obj in new_objects:
+            bpy.ops.object.select_all(action='DESELECT')
+            context.view_layer.objects.active = obj
+            obj.select_set(True)
+
+            # Apply scale/rotation for consistent UV projection later
+            bpy.ops.object.transform_apply(scale=True, rotation=True, location=False)
+
+            # Convert non-mesh types (curves, text, etc.) to mesh
+            if obj.type != 'MESH':
+                bpy.ops.object.convert(target='MESH')
+
+            # Apply all modifiers; skip any that fail (e.g. dependency cycles)
+            for mod in list(obj.modifiers):
+                try:
+                    bpy.ops.object.modifier_apply(modifier=mod.name)
+                except Exception:
+                    obj.modifiers.remove(mod)
+
+            # Remove shape keys (prevent join conflicts)
+            if hasattr(obj.data, 'shape_keys') and obj.data.shape_keys:
+                bpy.ops.object.shape_key_remove(all=True)
+
+            # Strip all materials
+            obj.data.materials.clear()
+
+        # Join all into one mesh
+        bpy.ops.object.select_all(action='DESELECT')
+        mesh_objs = [o for o in dest_col.objects if o.type == 'MESH']
+        if not mesh_objs:
+            self.report({'ERROR'}, "No mesh objects after processing")
+            return {'CANCELLED'}
+
+        for o in mesh_objs:
+            o.select_set(True)
+        context.view_layer.objects.active = mesh_objs[0]
+        bpy.ops.object.join()
+
+        result = context.active_object
+        result.name = col_name
+        self.report({'INFO'}, f"Ready: '{result.name}' — set as active for texture pipeline")
+        return {'FINISHED'}
+
+
+# =============================================================================
 # REGISTRATION
 # =============================================================================
 
@@ -572,6 +652,7 @@ INPUT_OPERATOR_CLASSES = (
     NEURO_OT_revert_prompt,
     NEURO_OT_copy_prompt,
     NEURO_OT_show_full_prompt,
+    NEURO_OT_merge_for_texture,
 )
 
 

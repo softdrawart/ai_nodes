@@ -19,6 +19,7 @@ from .utils import (
     guess_mime, register_temp_file, unique_temp_path,
     temp_files_registry, log_verbose
 )
+from .constants import LOG_PREFIX
 
 # Global cache for local model session to improve speed
 # Keeps model in RAM and don't reload it every time
@@ -148,24 +149,15 @@ def get_fal_image_size(aspect_ratio: str) -> str:
 # Gemini via Fal: fal-ai/nano-banana, fal-ai/nano-banana/edit
 
 _FAL_MODEL_ENDPOINTS = {
-    # GPT Image 1.0 - has /text-to-image and /edit-image suffixes
-    "gpt-image-1": {
+    # GPT Image (1.0) - has /text-to-image and /edit-image suffixes
+    "gpt-image": {
         "generate": "fal-ai/gpt-image-1/text-to-image",
         "edit": "fal-ai/gpt-image-1/edit-image",
     },
-    # GPT Image 1.5 - base path for generate, /edit for edit
-    "gpt-image-1.5": {
+    # GPT Image Pro (1.5) - base path for generate, /edit for edit
+    "gpt-image-pro": {
         "generate": "fal-ai/gpt-image-1.5",
         "edit": "fal-ai/gpt-image-1.5/edit",
-    },
-    # Gemini via Fal
-    "fal-gemini-2.5": {
-        "generate": "fal-ai/nano-banana",
-        "edit": "fal-ai/nano-banana/edit",
-    },
-    "fal-gemini-3-pro": {
-        "generate": "fal-ai/nano-banana-pro",
-        "edit": "fal-ai/nano-banana-pro/edit",
     },
 }
 
@@ -276,14 +268,22 @@ def generate_with_fal(
     args = {"prompt": prompt}
 
     # Add size for models that support it (only if not match_input_image)
-    if model_id.startswith("gpt-image") and aspect_ratio and aspect_ratio != "match_input_image":
+    if (model_id.startswith("gpt-image") or "gpt-image" in model_id) and aspect_ratio and aspect_ratio != "match_input_image":
         size = get_fal_image_size(aspect_ratio)
         args["image_size"] = size
 
-    # Add images if editing
+    # Add images if editing — use model config's param name when available
     if has_images:
-        # Grok Imagen expects 'image_url' (singular), not 'image_urls'
-        if "grok-imagen" in model_id:
+        try:
+            from .model_registry import get_model as _get_fal_model
+            fal_config = _get_fal_model(model_id)
+        except Exception:
+            fal_config = None
+
+        if fal_config and fal_config.image_param_name and fal_config.image_param_name != "image_urls":
+            param_name = fal_config.image_param_name
+            args[param_name] = image_urls if fal_config.image_as_array else image_urls[:1]
+        elif "grok-imagen" in model_id:
             args["image_url"] = image_urls[0]  # Single URL
         else:
             args["image_urls"] = image_urls
@@ -325,388 +325,6 @@ def generate_with_fal(
     return results
 
 
-# =============================================================================
-# AIML API IMAGE GENERATION
-# =============================================================================
-
-def generate_with_aiml(
-        model_id: str,
-        prompt: str,
-        image_paths: List[str] = None,
-        num_outputs: int = 1,
-        api_key: str = "",
-        timeout: int = 60,
-        aspect_ratio: str = "1:1",
-        model_params: Dict[str, Any] = None,
-        progress_callback=None,
-        cancel_event=None,
-) -> List[Any]:
-    """
-    Generate images using AIML API.
-
-    AIML provides unified access to multiple AI models through a single API.
-
-    Args:
-        model_id: Model identifier (e.g., "gpt-image-1-aiml")
-        prompt: Generation prompt
-        image_paths: Optional list of input image paths for editing
-        num_outputs: Number of images to generate (n parameter)
-        api_key: AIML API key
-        timeout: Request timeout in seconds
-        aspect_ratio: Aspect ratio string (converted to size)
-        model_params: Model-specific parameters
-        progress_callback: Optional progress callback
-        cancel_event: Optional threading.Event for cancellation
-
-    Returns:
-        List of PIL Image objects
-    """
-    import requests
-    import base64
-    from io import BytesIO
-
-    if not api_key:
-        raise ValueError("AIML API key is required")
-
-    if not Image:
-        raise RuntimeError("Pillow is required for AIML generation")
-
-    model_params = dict(model_params) if model_params else {}
-    image_paths = image_paths or []
-    results = []
-
-    # Pre-filter model_params to remove default/placeholder values that shouldn't be sent
-    # This prevents "Invalid payload" errors from APIs that don't accept these
-    keys_to_remove = [k for k, v in model_params.items()
-                      if v in ("match_input_image", "1K", "auto")]
-    for key in keys_to_remove:
-        del model_params[key]
-
-    # Get model config for endpoint info
-    from .model_registry import get_model
-    config = get_model(model_id)
-
-    # Determine the AIML model name
-    # Priority: model_params > config.endpoint > strip -aiml suffix
-    aiml_model = model_params.get("aiml_model_name")
-    if not aiml_model and config:
-        aiml_model = config.endpoint
-    if not aiml_model:
-        aiml_model = model_id.replace("-aiml", "") if model_id.endswith("-aiml") else model_id
-
-    # Check if this is an edit request (has input images)
-    is_edit = len(image_paths) > 0
-
-    # For edit mode, check if there's a separate edit endpoint
-    if is_edit and config and hasattr(config, 'edit_endpoint') and config.edit_endpoint:
-        aiml_model = config.edit_endpoint
-
-    # Check if this is GPT-Image model (needs special handling)
-    is_gpt_image = "gpt-image" in aiml_model.lower()
-
-    # GPT-Image models with input images need multipart form data to /edits endpoint
-    use_multipart = is_gpt_image and is_edit and len(image_paths) > 0
-
-    if use_multipart:
-        # Use edit endpoint with multipart form data
-        url = "https://api.aimlapi.com/v1/images/edits"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            # Don't set Content-Type - requests will set it automatically for multipart
-        }
-    else:
-        # Use generation endpoint with JSON
-        url = "https://api.aimlapi.com/v1/images/generations"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-    try:
-        if use_multipart:
-            # === MULTIPART FORM DATA FOR GPT-IMAGE EDITING ===
-            # Build form data
-            form_data = {
-                "model": aiml_model,
-                "prompt": prompt,
-            }
-
-            # Add size parameter
-            aspect_ratio = model_params.get("aspect_ratio", "1:1")
-            gpt_image_size_map = {
-                "1:1": "1024x1024",
-                "2:3": "1024x1536",
-                "3:2": "1536x1024",
-                "3:4": "1024x1536",
-                "4:3": "1536x1024",
-                "9:16": "1024x1536",
-                "16:9": "1536x1024",
-            }
-            form_data["size"] = gpt_image_size_map.get(aspect_ratio, "1024x1024")
-
-            # Add quality
-            quality = model_params.get("quality", "medium")
-            if quality == "auto":
-                quality = "medium"
-            form_data["quality"] = quality
-
-            # Add background if specified
-            if "background" in model_params:
-                form_data["background"] = model_params["background"]
-
-            # Prepare files for upload
-            # GPT-Image accepts multiple images via 'image' field
-            # IMPORTANT: Resize images to prevent 413 Payload Too Large errors
-            files = []
-            file_handles = []  # Keep track of file handles to close later
-            temp_resized_files = []  # Track temp files for cleanup
-
-            # Maximum dimension for AIML uploads (API limit is ~20MB, we target ~4MB)
-            MAX_DIMENSION = 1536
-
-            for i, path in enumerate(image_paths):
-                if os.path.exists(path):
-                    # Detect mime type
-                    if path.lower().endswith(".png"):
-                        mime = "image/png"
-                        img_format = "PNG"
-                    elif path.lower().endswith((".jpg", ".jpeg")):
-                        mime = "image/jpeg"
-                        img_format = "JPEG"
-                    elif path.lower().endswith(".webp"):
-                        mime = "image/webp"
-                        img_format = "WEBP"
-                    else:
-                        mime = "image/png"
-                        img_format = "PNG"
-
-                    # Load and potentially resize image
-                    try:
-                        img = Image.open(path)
-                        width, height = img.size
-
-                        # Resize if any dimension exceeds MAX_DIMENSION
-                        if width > MAX_DIMENSION or height > MAX_DIMENSION:
-                            # Calculate new size maintaining aspect ratio
-                            if width > height:
-                                new_width = MAX_DIMENSION
-                                new_height = int(height * (MAX_DIMENSION / width))
-                            else:
-                                new_height = MAX_DIMENSION
-                                new_width = int(width * (MAX_DIMENSION / height))
-
-                            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                            log_verbose(
-                                f"Resized image from {width}x{height} to {new_width}x{new_height} for AIML upload",
-                                "AIML")
-
-                            # Save to temp file
-                            from .utils import unique_temp_path, register_temp_file
-                            temp_path = register_temp_file(
-                                unique_temp_path(prefix="aiml_resize", ext=img_format.lower()))
-
-                            # Convert RGBA to RGB for JPEG
-                            if img_format == "JPEG" and img.mode == "RGBA":
-                                img = img.convert("RGB")
-
-                            img.save(temp_path, format=img_format, quality=90 if img_format == "JPEG" else None)
-                            temp_resized_files.append(temp_path)
-
-                            f = open(temp_path, "rb")
-                            file_handles.append(f)
-                            filename = os.path.basename(temp_path)
-                        else:
-                            # Use original file
-                            f = open(path, "rb")
-                            file_handles.append(f)
-                            filename = os.path.basename(path)
-
-                        img.close()
-                    except Exception as e:
-                        log_verbose(f"Failed to process image {path}: {e}", "AIML")
-                        # Fallback: use original file
-                        f = open(path, "rb")
-                        file_handles.append(f)
-                        filename = os.path.basename(path)
-
-                    # Use 'image' as field name (API accepts array of images)
-                    files.append(("image", (filename, f, mime)))
-
-            log_verbose(f"AIML GPT-Image edit: model={aiml_model}, images={len(files)}, size={form_data.get('size')}",
-                        "AIML")
-
-            if progress_callback:
-                progress_callback(10.0)
-
-            try:
-                # Make multipart request
-                response = requests.post(
-                    url,
-                    headers=headers,
-                    data=form_data,
-                    files=files,
-                    timeout=timeout
-                )
-            finally:
-                # Close all file handles
-                for f in file_handles:
-                    f.close()
-
-        else:
-            # === JSON PAYLOAD FOR GENERATION (no images) ===
-            payload = {
-                "model": aiml_model,
-                "prompt": prompt,
-                "response_format": "b64_json"
-            }
-
-            # [FIX] Imagen models fail with response_format, others benefit from it
-            if "imagen" not in aiml_model.lower():
-                payload["response_format"] = "b64_json"
-
-            # Handle GPT-Image models - they use 'size' not aspect_ratio/resolution
-            if is_gpt_image:
-                aspect_ratio = model_params.get("aspect_ratio", "1:1")
-                gpt_image_size_map = {
-                    "1:1": "1024x1024",
-                    "2:3": "1024x1536",
-                    "3:2": "1536x1024",
-                    "3:4": "1024x1536",
-                    "4:3": "1536x1024",
-                    "9:16": "1024x1536",
-                    "16:9": "1536x1024",
-                }
-                payload["size"] = gpt_image_size_map.get(aspect_ratio, "1024x1024")
-
-                quality = model_params.get("quality", "medium")
-                if quality == "auto":
-                    quality = "medium"
-                payload["quality"] = quality
-
-                if "background" in model_params:
-                    payload["background"] = model_params["background"]
-            else:
-                # Non-GPT-Image models - use standard parameters
-                if "quality" in model_params:
-                    payload["quality"] = model_params["quality"]
-                if "background" in model_params:
-                    payload["background"] = model_params["background"]
-                if "aspect_ratio" in model_params and model_params["aspect_ratio"] != "match_input_image":
-                    payload["aspect_ratio"] = model_params["aspect_ratio"]
-                # Only send resolution if explicitly set to 2K or 4K (1K is default everywhere)
-                if "resolution" in model_params and model_params["resolution"] in ("2K", "4K"):
-                    payload["resolution"] = model_params["resolution"]
-
-                # Add images for non-GPT-Image models (base64/URL method)
-                if is_edit and len(image_paths) > 0 and "imagen" not in aiml_model.lower():
-                    image_urls = []
-                    for path in image_paths:
-                        if path.startswith("http"):
-                            image_urls.append(path)
-                        elif os.path.exists(path):
-                            with open(path, "rb") as f:
-                                img_data = f.read()
-                            if path.lower().endswith(".png"):
-                                mime = "image/png"
-                            elif path.lower().endswith((".jpg", ".jpeg")):
-                                mime = "image/jpeg"
-                            else:
-                                mime = "image/png"
-                            data_url = f"data:{mime};base64,{base64.b64encode(img_data).decode('utf-8')}"
-                            image_urls.append(data_url)
-                    if image_urls:
-                        payload["image_urls"] = image_urls
-
-            # Common optional params
-            if "enhance_prompt" in model_params:
-                payload["enhance_prompt"] = model_params["enhance_prompt"]
-            if "person_generation" in model_params:
-                payload["person_generation"] = model_params["person_generation"]
-            if "safety_setting" in model_params:
-                payload["safety_setting"] = model_params["safety_setting"]
-
-            log_verbose(f"AIML API request: model={aiml_model}, edit={is_edit}, has_images={len(image_paths)}", "AIML")
-
-            if progress_callback:
-                progress_callback(10.0)
-
-            # Make JSON request
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=timeout
-            )
-
-        if cancel_event and cancel_event.is_set():
-            return results
-
-        if progress_callback:
-            progress_callback(80.0)
-
-        response.raise_for_status()
-        data = response.json()
-
-        # Parse response - AIML format:
-        # {"images": [{"url": "...", "content_type": "...", ...}], "description": "..."}
-        if "images" in data:
-            for item in data["images"]:
-                if cancel_event and cancel_event.is_set():
-                    break
-
-                if "url" in item:
-                    # Download image from URL
-                    img_response = requests.get(item["url"], timeout=30)
-                    img_response.raise_for_status()
-                    img = Image.open(BytesIO(img_response.content))
-                    img.load()
-                    results.append(img)
-                elif "b64_json" in item:
-                    # Base64 encoded image (fallback)
-                    img_data = base64.b64decode(item["b64_json"])
-                    img = Image.open(BytesIO(img_data))
-                    img.load()
-                    results.append(img)
-
-        # Also check OpenAI-compatible format (fallback)
-        elif "data" in data:
-            for item in data["data"]:
-                if cancel_event and cancel_event.is_set():
-                    break
-
-                if "url" in item:
-                    img_response = requests.get(item["url"], timeout=30)
-                    img_response.raise_for_status()
-                    img = Image.open(BytesIO(img_response.content))
-                    img.load()
-                    results.append(img)
-                elif "b64_json" in item:
-                    img_data = base64.b64decode(item["b64_json"])
-                    img = Image.open(BytesIO(img_data))
-                    img.load()
-                    results.append(img)
-
-        if progress_callback:
-            progress_callback(100.0)
-
-        log_verbose(f"AIML generated {len(results)} image(s)", "AIML")
-
-    except requests.exceptions.HTTPError as e:
-        error_msg = str(e)
-        try:
-            error_data = e.response.json()
-            if "error" in error_data:
-                error_msg = error_data["error"].get("message", str(e))
-        except Exception:
-            pass
-        print(f"[AIML] HTTP error: {error_msg}")
-        raise RuntimeError(f"AIML API error: {error_msg}")
-
-    except Exception as e:
-        print(f"[AIML] Generation error: {e}")
-        raise
-
-    return results
 
 
 # =============================================================================
@@ -767,58 +385,63 @@ def generate_with_replicate(
     # Build input arguments
     input_args = {"prompt": prompt}
 
-    # Handle input images
+    # Handle input images - use config to determine param name and format
     if image_paths:
         image_urls = _prepare_images_as_data_urls(image_paths)
         if image_urls:
-            # GPT Image models use "input_images" as a list
-            if "gpt-image" in model_id:
-                input_args["input_images"] = image_urls
-            elif "nano-banana" in endpoint or "nano-banana" in model_id:
-                # nano-banana on Replicate uses "image_input" array
-                input_args["image_input"] = image_urls
-                log_verbose(f"Added image_input array: {len(image_urls)} image(s)", "Replicate")
+            if config:
+                param_name = config.image_param_name
+                if config.image_as_array:
+                    input_args[param_name] = image_urls
+                else:
+                    input_args[param_name] = image_urls[0]
             else:
+                # Fallback for unknown models
                 input_args["image"] = image_urls[0]
-            log_verbose(f"Input images count: {len(image_urls)}", "Replicate")
+            log_verbose(f"Input images: {len(image_urls)} via '{config.image_param_name if config else 'image'}'", "Replicate")
 
-    # Inject OpenAI API key ONLY for gpt-image-1 (not 1.5) on Replicate
-    # gpt-image-1.5 does NOT require OpenAI key, only Replicate key
-    needs_openai_key = ("gpt-image-1" in model_id or "gpt-image-1" in endpoint) and \
-                       "gpt-image-1.5" not in model_id and "gpt-image-1.5" not in endpoint
+    # Inject OpenAI API key ONLY for gpt-image (1.0) on Replicate, not gpt-image-pro (1.5)
+    # gpt-image-pro (1.5) does NOT require OpenAI key, only Replicate key
+    needs_openai_key = ("gpt-image-oai" in model_id or "gpt-image-1" in endpoint) and \
+                       "gpt-image-pro" not in model_id and "gpt-image-1.5" not in endpoint
 
     if needs_openai_key:
         if openai_api_key and len(openai_api_key) > 10:
             input_args["openai_api_key"] = openai_api_key
-            log_verbose("OpenAI API key injected for GPT Image 1", "Replicate")
+            log_verbose("OpenAI API key injected for GPT Image", "Replicate")
         else:
-            raise Exception("OpenAI API key required for GPT Image 1 on Replicate. "
-                            "Add your OpenAI key in addon preferences, or use GPT Image 1.5 instead.")
+            raise Exception("OpenAI API key required for GPT Image on Replicate. "
+                            "Add your OpenAI key in addon preferences, or use GPT Image Pro instead.")
 
-    # Add model-specific params first (these take priority, but filter out defaults)
+    # Add model-specific params from models.py config
+    # Filter out placeholder values that mean "use API default"
     if model_params:
         for key, value in model_params.items():
-            # Skip values that shouldn't be sent to API
             if value in ("match_input_image", "1K", "auto"):
                 continue
             input_args[key] = value
         log_verbose(f"Model params: {model_params}", "Replicate")
 
-    # Add aspect ratio if not already in model_params
+    # Add aspect ratio fallback if not already provided by model_params
+    # Validate against model's accepted values to prevent 422 errors
     if "aspect_ratio" not in input_args:
         if aspect_ratio and aspect_ratio != "match_input_image":
-            input_args["aspect_ratio"] = aspect_ratio
-
-    # Add resolution for models that support it (if not already in model_params)
-    if "resolution" not in input_args and "nano-banana-pro" in endpoint:
-        input_args["resolution"] = resolution
+            if config:
+                ar_param = config.get_param("aspect_ratio")
+                if ar_param and ar_param.options and aspect_ratio not in ar_param.options:
+                    input_args["aspect_ratio"] = ar_param.default
+                    log_verbose(f"Aspect ratio '{aspect_ratio}' not supported, using default '{ar_param.default}'", "Replicate")
+                else:
+                    input_args["aspect_ratio"] = aspect_ratio
+            else:
+                input_args["aspect_ratio"] = aspect_ratio
 
     # Generate
     results = []
     max_outputs = min(num_outputs, 4)  # Replicate typically supports up to 4
 
     log_verbose(f"Final input_args keys: {list(input_args.keys())}", "Replicate")
-    log_verbose(f"Endpoint: {endpoint}, has images: {'image_url' in input_args or 'image' in input_args or 'input_images' in input_args}", "Replicate")
+    log_verbose(f"Endpoint: {endpoint}, images provided: {bool(image_paths)}", "Replicate")
 
     for i in range(max_outputs):
         if cancel_event and cancel_event.is_set():
@@ -866,7 +489,7 @@ def generate_images(
         image_paths: List[str] = None,
         num_outputs: int = 1,
         api_keys: Dict[str, str] = None,
-        timeout: int = 60,
+        timeout: int = 300,
         aspect_ratio: str = "1:1",
         resolution: str = "1K",
         model_params: Dict[str, Any] = None,
@@ -907,6 +530,28 @@ def generate_images(
     api_keys = api_keys or {}
     model_params = model_params or {}
     image_paths = image_paths or []
+
+    # ── NEUROTOKEN INTERCEPT ──
+    try:
+        from .config.config_proxy import is_neurotoken_mode, get_neurotoken
+        if is_neurotoken_mode():
+            # Internal builds: keygen gate must still pass (kill-switch / machine tracking)
+            from .config import is_internal, session_run
+            if is_internal() and session_run(model_id) is None:
+                raise ValueError("License validation failed. Please check your license key.")
+
+            from .config.proxy import generate_image as proxy_generate_image
+            return proxy_generate_image(
+                model_id=model_id,
+                prompt=prompt,
+                image_paths=image_paths,
+                num_outputs=num_outputs,
+                params=model_params,
+                neurotoken_key=get_neurotoken(),
+                timeout=timeout,
+            )
+    except ImportError:
+        pass
 
     config = _validate_session(model_id)
 
@@ -962,11 +607,14 @@ def generate_images(
         # Extract google_search from model_params
         google_search = model_params.pop("google_search", False)
 
+        # Use config.endpoint for actual Google API model name (not model_id)
+        google_model_name = config.endpoint if hasattr(config, 'endpoint') and config.endpoint else model_id
+
         return generate_with_gemini(
             prompt=prompt,
             image_paths=image_paths,
             num_outputs=num_outputs,
-            model_name=model_id,
+            model_name=google_model_name,
             api_key=google_key,
             timeout=timeout,
             aspect_ratio=aspect_ratio,
@@ -978,23 +626,6 @@ def generate_images(
             cancel_event=cancel_event,
         )
 
-    elif provider == Provider.AIML:
-        aiml_key = api_keys.get("aiml", "")
-        if not aiml_key:
-            raise ValueError("AIML API key required for this model")
-
-        return generate_with_aiml(
-            model_id=model_id,
-            prompt=prompt,
-            image_paths=image_paths,
-            num_outputs=num_outputs,
-            api_key=aiml_key,
-            timeout=timeout,
-            aspect_ratio=aspect_ratio,
-            model_params=model_params,
-            progress_callback=progress_callback,
-            cancel_event=cancel_event,
-        )
 
     else:
         raise ValueError(f"Unknown provider: {provider}")
@@ -1368,6 +999,29 @@ def trigger_model_download():
 def remove_background(image_path, api_keys, active_provider=None):
     """Unified background removal."""
     api_keys = api_keys or {}
+
+    # In neurotoken mode, route through proxy (fal-ai/birefnet)
+    try:
+        from .token_utils import is_nt_active, get_nt_key
+        if is_nt_active():
+            # Internal builds: keygen gate must still pass (kill-switch / machine tracking)
+            try:
+                from .config import is_internal, session_run
+                if is_internal() and session_run("birefnet-fal") is None:
+                    raise ValueError("License validation failed. Please check your license key.")
+            except ImportError:
+                pass
+
+            print("[BG Removal] Neurotoken mode — routing through proxy")
+            try:
+                from .config.proxy import remove_background as proxy_remove_bg
+                return proxy_remove_bg(image_path, neurotoken_key=get_nt_key())
+            except Exception as e:
+                print(f"[BG Removal] Proxy failed: {e}, falling back to local")
+                return remove_background_local(image_path)
+    except ImportError:
+        pass
+
     providers_order = ['replicate', 'fal', 'local']
     if active_provider == 'fal': providers_order = ['fal', 'replicate', 'local']
 
@@ -1592,7 +1246,9 @@ def generate_text_with_replicate(prompt, image_paths=None, model_id="gemini-3-pr
     # Add model-specific params
     if "gpt-5" in endpoint:
         input_args["verbosity"] = model_params.get("verbosity", "medium")
-        input_args["reasoning_effort"] = model_params.get("reasoning_effort", "minimal")
+        # Valid: "none","low","medium","high" (+ "xhigh" for 5.2). NOT "minimal"
+        effort = model_params.get("reasoning_effort", "low")
+        input_args["reasoning_effort"] = "low" if effort == "minimal" else effort
     elif "gemini-3" in endpoint:
         input_args["thinking_level"] = model_params.get("thinking_level", "low")
 
@@ -1618,122 +1274,6 @@ def generate_text_with_replicate(prompt, image_paths=None, model_id="gemini-3-pr
         raise
 
 
-# =============================================================================
-# TEXT GENERATION (AIML)
-# =============================================================================
-
-def generate_text_with_aiml(prompt, image_paths=None, model_id="", api_key="",
-                            model_params=None, timeout=120):
-    """
-    Generate text using AIML API (Chat Completions endpoint).
-
-    Args:
-        prompt: The text prompt
-        image_paths: List of image file paths to include (multimodal)
-        model_id: Model identifier (e.g. gpt-5-aiml)
-        api_key: AIML API key
-        model_params: Model-specific parameters
-        timeout: Request timeout in seconds
-
-    Returns:
-        Generated text string
-    """
-    import requests
-    import base64
-
-    if not api_key:
-        raise ValueError("AIML API key is required")
-
-    model_params = model_params or {}
-    image_paths = image_paths or []
-
-    # Get endpoint from registry
-    from .model_registry import get_model
-    config = get_model(model_id)
-
-    # Priority: params > endpoint > model_id
-    aiml_model = model_params.get("aiml_model_name")
-    if not aiml_model:
-        aiml_model = config.endpoint if config else model_id
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    # Use Chat Completions API (works for all AIML models including GPT-5)
-    url = "https://api.aimlapi.com/v1/chat/completions"
-
-    # Build messages
-    messages = []
-    user_content = []
-
-    # Add text prompt
-    user_content.append({"type": "text", "text": prompt})
-
-    # Add images (OpenAI Vision format)
-    if image_paths:
-        for path in image_paths:
-            try:
-                with open(path, "rb") as f:
-                    img_data = base64.b64encode(f.read()).decode("utf-8")
-
-                # Determine mime type
-                mime = "image/jpeg"
-                if path.lower().endswith(".png"):
-                    mime = "image/png"
-                elif path.lower().endswith(".webp"):
-                    mime = "image/webp"
-
-                user_content.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime};base64,{img_data}"
-                    }
-                })
-            except Exception as e:
-                print(f"[AIML] Failed to read image {path}: {e}")
-
-    messages.append({"role": "user", "content": user_content})
-
-    # Build Payload
-    payload = {
-        "model": aiml_model,
-        "messages": messages,
-        "max_tokens": model_params.get("max_tokens", 2048),
-        "temperature": model_params.get("temperature", 1.0),
-        "stream": False
-    }
-
-    # Add reasoning_effort for models that support it (GPT-5 series)
-    if "reasoning_effort" in model_params and "gpt-5" in aiml_model.lower():
-        effort = model_params["reasoning_effort"]
-        # Don't send 'none' as it may not be needed
-        if effort and effort != "none":
-            # !!! AIML does not support 'minimal', map it to 'low'
-            if effort == "minimal":
-                effort = "low"
-            payload["reasoning_effort"] = effort
-
-    log_verbose(f"AIML Text request: model={aiml_model}, params={model_params}", "AIML")
-
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        response.raise_for_status()
-        data = response.json()
-
-        if "choices" in data and len(data["choices"]) > 0:
-            content = data["choices"][0].get("message", {}).get("content", "")
-            return content.strip()
-
-        return None
-
-    except requests.exceptions.HTTPError as e:
-        print(f"[AIML] Text generation error: {e}")
-        raise
-    except Exception as e:
-        print(f"[AIML] Text generation error: {e}")
-        raise
 
 
 def generate_text(prompt, image_paths=None, model_id="", api_keys=None,
@@ -1748,6 +1288,27 @@ def generate_text(prompt, image_paths=None, model_id="", api_keys=None,
 
     api_keys = api_keys or {}
     model_params = model_params or {}
+
+    # ── NEUROTOKEN INTERCEPT ──
+    try:
+        from .config.config_proxy import is_neurotoken_mode, get_neurotoken
+        if is_neurotoken_mode():
+            # Internal builds: keygen gate must still pass (kill-switch / machine tracking)
+            from .config import is_internal, session_run
+            if is_internal() and session_run(model_id) is None:
+                raise ValueError("License validation failed. Please check your license key.")
+
+            from .config.proxy import generate_text as proxy_generate_text
+            return proxy_generate_text(
+                model_id=model_id,
+                prompt=prompt,
+                image_paths=image_paths,
+                params=model_params,
+                neurotoken_key=get_neurotoken(),
+                timeout=timeout,
+            )
+    except ImportError:
+        pass
 
     config = _validate_session(model_id)
 
@@ -1768,18 +1329,6 @@ def generate_text(prompt, image_paths=None, model_id="", api_keys=None,
             model_params=model_params,
             timeout=timeout,
         )
-    elif provider == Provider.AIML:
-        aiml_key = api_keys.get("aiml", "")
-        if not aiml_key:
-            raise ValueError("AIML API key required")
-        return generate_text_with_aiml(
-            prompt=prompt,
-            image_paths=image_paths,
-            model_id=model_id,
-            api_key=aiml_key,
-            model_params=model_params,
-            timeout=timeout,
-        )
     else:
         google_key = api_keys.get("google", "")
         if not google_key:
@@ -1788,10 +1337,13 @@ def generate_text(prompt, image_paths=None, model_id="", api_keys=None,
         thinking_level = model_params.get("thinking_level", "none")
         use_google_search = model_params.get("use_google_search", False)
 
+        # Use config.endpoint for actual Google API model name
+        google_model_name = config.endpoint if hasattr(config, 'endpoint') and config.endpoint else model_id
+
         return generate_text_with_gemini(
             prompt=prompt,
             image_paths=image_paths,
-            model_name=model_id,
+            model_name=google_model_name,
             api_key=google_key,
             thinking_level=thinking_level,
             use_google_search=use_google_search,

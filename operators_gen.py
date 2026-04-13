@@ -25,6 +25,7 @@ from .utils import (
 )
 from .operators import get_current_gen_id, increment_gen_id
 from . import status_manager
+from .constants import LOG_PREFIX
 
 # =============================================================================
 # IMAGE GENERATION OPERATOR
@@ -46,7 +47,7 @@ class NEURO_OT_generate_image(bpy.types.Operator):
 
         scn = context.scene
         prompt = scn.neuro_prompt_image.strip()
-        google_key, fal_key, replicate_key, aiml_key = get_api_keys(context)
+        google_key, fal_key, replicate_key = get_api_keys(context)
         all_api_keys = get_all_api_keys(context)
 
         if not prompt:
@@ -79,12 +80,12 @@ class NEURO_OT_generate_image(bpy.types.Operator):
             required_key = config.requires_api_key
             key_value = all_api_keys.get(required_key, "").strip()
             if not key_value:
-                key_names = {"google": "Google", "replicate": "Replicate", "fal": "Fal.AI", "aiml": "AIML"}
+                key_names = {"google": "Google", "replicate": "Replicate", "fal": "Fal.AI"}
                 self.report({'ERROR'}, f"Please enter {key_names.get(required_key, required_key)} API key in settings")
                 return {'CANCELLED'}
         else:
             # Fallback for unknown models
-            if model_name.startswith("gpt-image") or model_name.startswith("fal-gemini"):
+            if model_name.startswith("gpt-image"):
                 if not fal_key.strip():
                     self.report({'ERROR'}, "Please enter Fal.AI API key in settings")
                     return {'CANCELLED'}
@@ -316,7 +317,7 @@ class NEURO_OT_generate_texture(bpy.types.Operator):
             return self.execute(context)
 
         obj = context.active_object
-        is_gpt = scn.neuro_generation_model == "gpt-image-1"
+        is_gpt = scn.neuro_generation_model == "gpt-image-oai"
         has_uvs = obj and obj.type == 'MESH' and len(obj.data.uv_layers) > 0
 
         if is_gpt or has_uvs:
@@ -336,7 +337,7 @@ class NEURO_OT_generate_texture(bpy.types.Operator):
             col.label(text="Removes background for better map extraction.", icon='INFO')
         else:
             obj = context.active_object
-            if scn.neuro_generation_model == "gpt-image-1":
+            if scn.neuro_generation_model == "gpt-image-oai":
                 box = layout.box()
                 box.label(text=" GPT Image Model Selected", icon='ERROR')
                 box.label(text="Creates concepts, not aligned textures.")
@@ -361,7 +362,7 @@ class NEURO_OT_generate_texture(bpy.types.Operator):
         scn = context.scene
         gen_type = getattr(scn, "neuro_texture_gen_type", "COLOR")
         prompt = scn.neuro_prompt_texture.strip()
-        google_key, fal_key, replicate_key, aiml_key = get_api_keys(context)
+        google_key, fal_key, replicate_key = get_api_keys(context)
         all_api_keys = get_all_api_keys(context)
 
         my_gen_id = increment_gen_id()
@@ -455,7 +456,7 @@ class NEURO_OT_generate_texture(bpy.types.Operator):
 
                     set_status(f"Generating {type_tag.lower()} map...")
                     try:
-                        api_keys = {"google": g_key, "fal": fal_key, "repl":replicate_key,"aiml": aiml_key}
+                        api_keys = {"google": g_key, "fal": fal_key, "replicate": replicate_key}
                         imgs = generate_images(
                             model_id=model,
                             prompt=p_text,
@@ -583,7 +584,9 @@ class NEURO_OT_generate_texture(bpy.types.Operator):
             return {'CANCELLED'}
 
         num_out = max(1, min(4, scn.neuro_num_outputs))
-        model_name = scn.neuro_generation_model
+        tex_model_canonical = getattr(scn, 'neuro_texture_model', 'nano-banana')
+        from .model_registry import resolve_model
+        model_name = resolve_model(tex_model_canonical, context=context) or scn.neuro_generation_model
 
         update_status(context, "Preparing texture generation...")
 
@@ -831,13 +834,13 @@ class NEURO_OT_generate_texture(bpy.types.Operator):
                     if gen_id == get_current_gen_id() and not cancel_event.is_set():
                         print(f"[{LOG_PREFIX}] Worker exception:", e)
 
-                    # Status Manager
-                    if cancel_event.is_set():
-                        status_manager.cancel_job(job_id)
-                    elif imgs:
-                        status_manager.complete_job(job_id, success=True)
-                    else:
-                        status_manager.complete_job(job_id, success=False, error="Texture gen failed")
+                # Status Manager
+                if cancel_event.is_set():
+                    status_manager.cancel_job(job_id)
+                elif imgs:
+                    status_manager.complete_job(job_id, success=True)
+                else:
+                    status_manager.complete_job(job_id, success=False, error="Texture gen failed")
 
                 saved_paths = []
                 batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1040,33 +1043,32 @@ class NEURO_OT_apply_texture(bpy.types.Operator):
                 except Exception as e:
                     print(f"[{LOG_PREFIX}] Failed to load {group_name}: {e}")
 
-                # Create Node
-                if group_tree:
-                    group_node = nodes.new(type='ShaderNodeGroup')
-                    group_node.node_tree = group_tree
-                    group_node.label = "Quick Edit"
+            # Wire up — runs whether group was cached in bpy.data or freshly loaded
+            if group_tree:
+                group_node = nodes.new(type='ShaderNodeGroup')
+                group_node.node_tree = group_tree
+                group_node.label = "Quick Edit"
 
-                    tex_node.location = (X_TEX, offset_y)
-                    group_node.location = (X_MID, offset_y)
-                    principled.location = (X_BSDF, 0)
+                tex_node.location = (X_TEX, offset_y)
+                group_node.location = (X_MID, offset_y)
+                principled.location = (X_BSDF, 0)
 
-                    try:
-                        # Robust linking
-                        if 'Color' in group_node.inputs:
-                            links.new(tex_node.outputs['Color'], group_node.inputs['Color'])
-                        else:
-                            links.new(tex_node.outputs['Color'], group_node.inputs[0])
+                try:
+                    if 'Color' in group_node.inputs:
+                        links.new(tex_node.outputs['Color'], group_node.inputs['Color'])
+                    else:
+                        links.new(tex_node.outputs['Color'], group_node.inputs[0])
 
-                        if 'Color' in group_node.outputs:
-                            links.new(group_node.outputs['Color'], principled.inputs['Base Color'])
-                        else:
-                            links.new(group_node.outputs[0], principled.inputs['Base Color'])
-                    except Exception as e:
-                        print(f"[{LOG_PREFIX}] Group linking failed: {e}")
-                        links.new(tex_node.outputs['Color'], principled.inputs['Base Color'])
-                else:
-                    tex_node.location = (X_MID, offset_y)
+                    if 'Color' in group_node.outputs:
+                        links.new(group_node.outputs['Color'], principled.inputs['Base Color'])
+                    else:
+                        links.new(group_node.outputs[0], principled.inputs['Base Color'])
+                except Exception as e:
+                    print(f"[{LOG_PREFIX}] Group linking failed: {e}")
                     links.new(tex_node.outputs['Color'], principled.inputs['Base Color'])
+            else:
+                tex_node.location = (X_MID, offset_y)
+                links.new(tex_node.outputs['Color'], principled.inputs['Base Color'])
 
         elif map_type in ['ROUGHNESS', 'METALLIC']:
             offset_y = -300 if map_type == 'ROUGHNESS' else -600
@@ -1232,8 +1234,9 @@ class NEURO_OT_generate_pbr_map(bpy.types.Operator):
                 return
 
             try:
+                from .model_registry import resolve_model
                 imgs = generate_images(
-                    model_id="gemini-3-pro-image-preview",
+                    model_id=resolve_model("nano-banana-pro", context=context),
                     prompt=prompt,
                     image_paths=[source_path],
                     num_outputs=1,

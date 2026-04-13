@@ -16,6 +16,7 @@ from .utils import (
 )
 from .nodes_core import NeuroNodeBase, node_preview_collection
 from .nodes_ops_common import get_node_tree
+from .constants import LOG_PREFIX
 
 
 # =============================================================================
@@ -255,6 +256,90 @@ class NEURO_OT_node_history_nav(Operator):
         return {'FINISHED'}
 
 
+class NEURO_OT_node_double_click_view(Operator):
+    """Double-click a node to view its image in Image Editor"""
+    bl_idname = "neuro.node_double_click_view"
+    bl_label = "View Node Image"
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.area and context.area.type == 'NODE_EDITOR' and
+                context.space_data and hasattr(context.space_data, 'tree_type') and
+                context.space_data.tree_type == 'NeuroGenNodeTree')
+
+    def invoke(self, context, event):
+        # Get the node under the mouse
+        ntree = context.space_data.node_tree
+        if not ntree:
+            return {'PASS_THROUGH'}
+
+        # Find active node (Blender sets this on click, which happens before double-click)
+        node = ntree.nodes.active
+        if not node:
+            return {'PASS_THROUGH'}
+
+        # Get image path from the node
+        image_path = None
+
+        # Special: Merge Design node — cycle active result on double-click (A→B→C→D)
+        if node.bl_idname == 'NeuroMergeStyleNode' and hasattr(node, 'active_result'):
+            slots = ['A', 'B', 'C', 'D']
+            paths = {
+                'A': node.result_path_a, 'B': node.result_path_b,
+                'C': node.result_path_c, 'D': node.result_path_d,
+            }
+            cur = node.active_result
+            idx = slots.index(cur) if cur in slots else 0
+            for i in range(1, 5):
+                nxt = slots[(idx + i) % 4]
+                p = paths.get(nxt, "")
+                if p and os.path.exists(p):
+                    node.active_result = nxt
+                    image_path = p
+                    break
+
+            if image_path:
+                bpy.ops.neuro.node_view_full_image(image_path=image_path)
+                return {'FINISHED'}
+
+        # Special: Reference node — cycle through images on double-click
+        if node.bl_idname == 'NeuroReferenceNode' and hasattr(node, 'get_image_paths_list'):
+            paths = node.get_image_paths_list()
+            if len(paths) > 1:
+                idx = min(node.current_index, len(paths) - 1)
+                new_idx = (idx + 1) % len(paths)
+                node.current_index = new_idx
+                node.image_path = paths[new_idx]
+                bpy.ops.neuro.node_view_full_image(image_path=paths[new_idx])
+                return {'FINISHED'}
+            elif len(paths) == 1:
+                bpy.ops.neuro.node_view_full_image(image_path=paths[0])
+                return {'FINISHED'}
+
+        # Priority 1: result_path (Generate, Inpaint, Tools, etc.)
+        if hasattr(node, 'result_path') and node.result_path:
+            if os.path.exists(node.result_path):
+                image_path = node.result_path
+
+        # Priority 2: get_image_path() (Reference nodes, etc.)
+        if not image_path and hasattr(node, 'get_image_path'):
+            try:
+                path = node.get_image_path()
+                if path and os.path.exists(path):
+                    image_path = path
+            except Exception:
+                pass
+
+        if not image_path:
+            # Not a node with an image, let Blender handle the double-click normally
+            return {'PASS_THROUGH'}
+
+        # Open the image — reuse existing view_full_image operator
+        bpy.ops.neuro.node_view_full_image(image_path=image_path)
+        return {'FINISHED'}
+
+
 class NEURO_OT_node_view_full_image(Operator):
     bl_idname = "neuro.node_view_full_image"
     bl_label = "View Full Image"
@@ -270,7 +355,7 @@ class NEURO_OT_node_view_full_image(Operator):
         # Find existing image first (avoid duplicates)
         img = None
 
-        # Method 1: By filepath
+        # Method 1: Find by filepath (most reliable — handles autopack/Save As)
         for existing_img in bpy.data.images:
             if existing_img.filepath:
                 try:
@@ -281,9 +366,16 @@ class NEURO_OT_node_view_full_image(Operator):
                 except Exception:
                     pass
 
-        # Method 2: By exact name
+        # Method 2: Find by name ONLY if filepath matches too
+        # (Don't use bare name lookup — causes cross-node image collision after Save As)
         if not img:
-            img = bpy.data.images.get(img_name)
+            candidate = bpy.data.images.get(img_name)
+            if candidate and candidate.filepath:
+                try:
+                    if os.path.abspath(bpy.path.abspath(candidate.filepath)) == abs_path:
+                        img = candidate
+                except Exception:
+                    pass
 
         # Method 3: Load fresh only if not found
         if not img:
@@ -327,6 +419,61 @@ class NEURO_OT_node_view_full_image(Operator):
             except Exception as e:
                 print(f"[{LOG_PREFIX}] Could not open Image Editor: {e}")
 
+        return {'FINISHED'}
+
+
+class NEURO_OT_node_open_paint_smart(Operator):
+    """Open image in configured editor (Blender paint or Photoshop)"""
+    bl_idname = "neuro.node_open_paint_smart"
+    bl_label = "Open in Editor"
+    node_name: StringProperty()
+
+    def execute(self, context):
+        import bpy as _bpy
+        editor = 'BLENDER'
+        for pkg in [__package__, "ai_nodes"]:
+            if pkg and pkg in context.preferences.addons:
+                editor = getattr(context.preferences.addons[pkg].preferences, 'editor_type', 'BLENDER')
+                break
+
+        if editor == 'BLENDER':
+            return _bpy.ops.neuro.node_open_paint(node_name=self.node_name)
+
+        # ── PHOTOSHOP MODE ─────────────────────────────────────────────
+        ntree = get_node_tree(context, None)
+        if not ntree:
+            return {'CANCELLED'}
+        node = ntree.nodes.get(self.node_name)
+        if not node:
+            return {'CANCELLED'}
+
+        # Already a PS Bridge node — open in PS directly
+        if node.bl_idname == 'NeuroPSBridgeNode':
+            return _bpy.ops.neuro.ps_edit(node_name=node.name)
+
+        # Verify we have an image
+        img_path = None
+        if hasattr(node, 'result_path') and node.result_path and os.path.exists(node.result_path):
+            img_path = node.result_path
+        elif hasattr(node, 'get_image_path'):
+            img_path = node.get_image_path()
+        if not img_path or not os.path.exists(img_path):
+            self.report({'WARNING'}, "No image to open")
+            return {'CANCELLED'}
+
+        # Create PS Bridge node beside source
+        ps_node = ntree.nodes.new('NeuroPSBridgeNode')
+        ps_node.location = (node.location.x + node.width + 50, node.location.y)
+
+        # Connect first visible image output → PS Bridge input
+        for sock in node.outputs:
+            if sock.bl_idname == 'NeuroImageSocket' and not sock.hide:
+                ps_in = ps_node.inputs.get("Image")
+                if ps_in:
+                    ntree.links.new(sock, ps_in)
+                break
+
+        _bpy.ops.neuro.ps_edit(node_name=ps_node.name)
         return {'FINISHED'}
 
 
@@ -387,23 +534,27 @@ class NEURO_OT_node_open_paint(Operator):
         # Load/get the image - prefer finding by filepath first
         img = None
 
-        # Method 1: Find by filepath (most reliable)
+        # Method 1: Find by filepath (most reliable — handles autopack/Save As)
         for existing_img in bpy.data.images:
             if existing_img.filepath:
                 try:
                     existing_path = os.path.abspath(bpy.path.abspath(existing_img.filepath))
                     if existing_path == abs_path:
                         img = existing_img
-                        print(f"[{LOG_PREFIX} Paint] Found existing image by path: {img.name}")
                         break
                 except Exception:
                     pass
 
-        # Method 2: Find by exact name
+        # Method 2: Find by name ONLY if filepath matches too
+        # (Don't use bare name lookup — causes cross-node image collision after Save As)
         if not img:
-            img = bpy.data.images.get(img_name)
-            if img:
-                print(f"[{LOG_PREFIX} Paint] Found existing image by name: {img.name}")
+            candidate = bpy.data.images.get(img_name)
+            if candidate and candidate.filepath:
+                try:
+                    if os.path.abspath(bpy.path.abspath(candidate.filepath)) == abs_path:
+                        img = candidate
+                except Exception:
+                    pass
 
         # Method 3: Load fresh
         if not img:
@@ -613,14 +764,18 @@ class NEURO_OT_node_load_files_multi(Operator):
     directory: StringProperty(subtype='DIR_PATH')
     files: CollectionProperty(type=bpy.types.OperatorFileListElement)
     node_name: StringProperty(default="")
+    tree_name: StringProperty(default="")
 
     def invoke(self, context, event):
+        if context.space_data and hasattr(context.space_data, 'node_tree') and context.space_data.node_tree:
+            self.tree_name = context.space_data.node_tree.name
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
-        ntree = get_node_tree(context, None)
-        if not ntree: return {'CANCELLED'}
+        ntree = get_node_tree(context, self.tree_name or None)
+        if not ntree:
+            return {'CANCELLED'}
 
         node = None
         if self.node_name:
@@ -637,8 +792,42 @@ class NEURO_OT_node_load_files_multi(Operator):
 
         if image_paths:
             node.set_image_paths_list(image_paths)
+            node.image_path = image_paths[0]  # backward compat for single-image display
             node.source_type = 'FILE'
             node.status_message = f"Loaded {len(image_paths)} images"
+
+        # Force redraw of node editor areas
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'NODE_EDITOR':
+                    area.tag_redraw()
+
+        return {'FINISHED'}
+
+
+class NEURO_OT_node_ref_navigate(Operator):
+    """Navigate between loaded images in Reference node"""
+    bl_idname = "neuro.node_ref_navigate"
+    bl_label = "Navigate Images"
+    node_name: StringProperty()
+    direction: IntProperty(default=1)  # +1 = next, -1 = prev
+
+    def execute(self, context):
+        ntree = get_node_tree(context, None)
+        if not ntree: return {'CANCELLED'}
+
+        node = ntree.nodes.get(self.node_name)
+        if not node: return {'CANCELLED'}
+
+        paths = node.get_image_paths_list()
+        if len(paths) < 2: return {'FINISHED'}
+
+        new_idx = (node.current_index + self.direction) % len(paths)
+        node.current_index = new_idx
+        node.image_path = paths[new_idx]
+
+        if context.area:
+            context.area.tag_redraw()
         return {'FINISHED'}
 
 
@@ -1189,32 +1378,48 @@ class BlenderJSONEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+_3D_EXT = {'.glb', '.gltf', '.fbx', '.obj', '.stl', '.ply'}
+
+
 class NEURO_OT_node_export(Operator):
     bl_idname = "neuro.node_export"
     bl_label = "Export Node Tree"
     filepath: StringProperty(subtype='FILE_PATH')
     include_images: BoolProperty(name="Include Images", default=True)
+    include_3d: BoolProperty(name="Include 3D Files", default=True)
     filter_glob: StringProperty(default="*.json;*.zip", options={'HIDDEN'})
 
     def invoke(self, context, event):
         if context.space_data.node_tree:
-            self.filepath = context.space_data.node_tree.name + (".zip" if self.include_images else ".json")
+            use_zip = self.include_images or self.include_3d
+            self.filepath = context.space_data.node_tree.name + (".zip" if use_zip else ".json")
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "include_images")
+        layout.prop(self, "include_3d")
+
     def execute(self, context):
+        import sys
+        _bl = sys.modules.get(__package__)
+        version_str = ".".join(map(str, _bl.bl_info["version"])) if (_bl and hasattr(_bl, 'bl_info')) else "unknown"
+
         ntree = context.space_data.node_tree
         if not ntree: return {'CANCELLED'}
 
         data = {
-            "version": "1.8.0",
+            "version": version_str,
             "tree_name": ntree.name,
             "preview_scale": getattr(ntree, 'preview_scale', 1.0),
             "nodes": [],
             "links": [],
-            "images": {}
+            "images": {},
+            "models": {}
         }
         image_paths = {}
+        model_paths = {}
 
         for node in ntree.nodes:
             node_data = {
@@ -1238,14 +1443,23 @@ class NEURO_OT_node_export(Operator):
                     pass
             # -------------------------------------------------------------------
 
-            # Handle images - include all path properties
-            image_props = ['result_path', 'image_path', 'front_path', 'left_path', 'right_path', 'back_path']
-            for p in image_props:
+            # Route file path properties to images or models based on extension
+            path_props = ['result_path', 'image_path', 'front_path', 'left_path', 'right_path', 'back_path']
+            for p in path_props:
                 val = getattr(node, p, "")
-                if val and os.path.exists(val):
-                    key = f"img_{len(image_paths)}"
-                    image_paths[key] = val
-                    node_data["properties"][f"{p}_key"] = key
+                if not val or not os.path.exists(val):
+                    continue
+                ext = os.path.splitext(val)[1].lower()
+                if ext in _3D_EXT:
+                    if self.include_3d:
+                        key = f"model_{len(model_paths)}"
+                        model_paths[key] = val
+                        node_data["properties"][f"{p}_key"] = key
+                else:
+                    if self.include_images:
+                        key = f"img_{len(image_paths)}"
+                        image_paths[key] = val
+                        node_data["properties"][f"{p}_key"] = key
 
             data["nodes"].append(node_data)
 
@@ -1258,19 +1472,20 @@ class NEURO_OT_node_export(Operator):
             })
 
         data["images"] = {k: os.path.basename(v) for k, v in image_paths.items()}
+        data["models"] = {k: os.path.basename(v) for k, v in model_paths.items()}
 
-        # --- KEY FIX: Use the custom encoder in json.dumps ---
-        if self.include_images and image_paths:
+        use_zip = (self.include_images and image_paths) or (self.include_3d and model_paths)
+        if use_zip:
             if not self.filepath.endswith('.zip'): self.filepath = self.filepath.rsplit('.', 1)[0] + '.zip'
             with zipfile.ZipFile(self.filepath, 'w', zipfile.ZIP_DEFLATED) as zf:
-                # cls=BlenderJSONEncoder is the magic fix
                 zf.writestr('nodes.json', json.dumps(data, indent=2, cls=BlenderJSONEncoder))
                 for k, p in image_paths.items():
                     zf.write(p, f"images/{os.path.basename(p)}")
+                for k, p in model_paths.items():
+                    zf.write(p, f"models/{os.path.basename(p)}")
         else:
             if not self.filepath.endswith('.json'): self.filepath = self.filepath.rsplit('.', 1)[0] + '.json'
             with open(self.filepath, 'w') as f:
-                # cls=BlenderJSONEncoder is the magic fix
                 json.dump(data, f, indent=2, cls=BlenderJSONEncoder)
 
         self.report({'INFO'}, f"Exported: {os.path.basename(self.filepath)}")
@@ -1361,6 +1576,198 @@ class NEURO_OT_node_import(Operator):
         return {'FINISHED'}
 
 
+class NEURO_OT_ps_edit(Operator):
+    """Open the node's image in Adobe Photoshop"""
+    bl_idname = "neuro.ps_edit"
+    bl_label = "Edit in Photoshop"
+    node_name: StringProperty()
+
+    def execute(self, context):
+        import subprocess
+        prefs = None
+        for pkg in [__package__, "ai_nodes"]:
+            if pkg and pkg in context.preferences.addons:
+                prefs = context.preferences.addons[pkg].preferences
+                break
+        if not prefs:
+            self.report({'ERROR'}, "Could not find addon preferences")
+            return {'CANCELLED'}
+
+        ps_path = getattr(prefs, 'photoshop_exe_path', '')
+        if not ps_path or not os.path.exists(ps_path):
+            self.report({'ERROR'}, "Set Photoshop path in addon preferences (Tools tab)")
+            return {'CANCELLED'}
+
+        ntree = get_node_tree(context, None)
+        if not ntree:
+            return {'CANCELLED'}
+        node = ntree.nodes.get(self.node_name)
+        if not node:
+            return {'CANCELLED'}
+
+        img_path = node.get_image_path() if hasattr(node, 'get_image_path') else None
+        if not img_path or not os.path.exists(img_path):
+            self.report({'WARNING'}, "No image to edit")
+            return {'CANCELLED'}
+
+        try:
+            subprocess.Popen([ps_path, img_path])
+            self.report({'INFO'}, "Opened in Photoshop")
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to launch Photoshop: {e}")
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+
+class NEURO_OT_ps_grab(Operator):
+    """Grab the active Photoshop document as PNG into this node"""
+    bl_idname = "neuro.ps_grab"
+    bl_label = "Grab from Photoshop"
+    node_name: StringProperty()
+
+    def execute(self, context):
+        import subprocess
+
+        ntree = get_node_tree(context, None)
+        if not ntree:
+            return {'CANCELLED'}
+        node = ntree.nodes.get(self.node_name)
+        if not node:
+            return {'CANCELLED'}
+
+        # Get PS exe path from preferences (same as ps_edit)
+        prefs = None
+        for pkg in [__package__, "ai_nodes"]:
+            if pkg and pkg in context.preferences.addons:
+                prefs = context.preferences.addons[pkg].preferences
+                break
+        ps_exe = getattr(prefs, 'photoshop_exe_path', '') if prefs else ''
+        if not ps_exe or not os.path.exists(ps_exe):
+            self.report({'ERROR'}, "Set Photoshop path in addon preferences (Tools tab)")
+            return {'CANCELLED'}
+
+        gen_dir = get_generations_folder("nodes/ps_bridge")
+        os.makedirs(gen_dir, exist_ok=True)
+        temp_path = os.path.join(gen_dir, "_ps_grab_temp.png")
+        js_path = temp_path.replace("\\", "/")
+        # Also write doc name to a sidecar txt so Python can read it
+        info_path = os.path.join(gen_dir, "_ps_grab_info.txt")
+        info_js = info_path.replace("\\", "/")
+
+        # Write ExtendScript — runs inside the already-open PS instance
+        jsx_content = (
+            'try {\n'
+            '  var doc = app.activeDocument;\n'
+            '  var dup = doc.duplicate("_grab_temp");\n'
+            '  dup.flatten();\n'
+            f'  var f = new File("{js_path}");\n'
+            '  var opts = new PNGSaveOptions();\n'
+            '  dup.saveAs(f, opts, true);\n'
+            '  dup.close(SaveOptions.DONOTSAVECHANGES);\n'
+            f'  var infoFile = new File("{info_js}");\n'
+            '  infoFile.open("w");\n'
+            '  infoFile.write(doc.name);\n'
+            '  infoFile.close();\n'
+            '} catch(e) {\n'
+            f'  var infoFile = new File("{info_js}");\n'
+            '  infoFile.open("w");\n'
+            '  infoFile.write("ERROR:" + e.message);\n'
+            '  infoFile.close();\n'
+            '}\n'
+        )
+        jsx_path = os.path.join(gen_dir, "_ps_grab.jsx")
+        with open(jsx_path, "w", encoding="utf-8") as fh:
+            fh.write(jsx_content)
+
+        # --- NEW: Clean up old files to prevent stale grabs ---
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        if os.path.exists(info_path):
+            try:
+                os.remove(info_path)
+            except OSError:
+                pass
+
+        # --- NEW: Capture Blender's window focus (Windows only) ---
+        hwnd = None
+        if os.name == 'nt':
+            import ctypes
+            try:
+                hwnd = ctypes.windll.user32.GetForegroundWindow()
+            except Exception:
+                pass
+
+        # Run JSX directly via Photoshop CLI — no COM, no PowerShell
+        try:
+            result = subprocess.run(
+                [ps_exe, jsx_path],
+                capture_output=True, text=True, timeout=30
+            )
+        except subprocess.TimeoutExpired:
+            self.report({'ERROR'}, "Photoshop grab timed out")
+            return {'CANCELLED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to launch Photoshop: {e}")
+            return {'CANCELLED'}
+
+        # --- NEW: Wait for PS to finish writing the info file ---
+        import time
+        wait_start = time.time()
+        while not os.path.exists(info_path):
+            if time.time() - wait_start > 15.0:  # 15 second timeout
+                self.report({'ERROR'}, "Photoshop script timed out")
+                return {'CANCELLED'}
+            time.sleep(0.1)
+
+        # --- NEW: Steal focus back to Blender ---
+        if hwnd and os.name == 'nt':
+            try:
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+
+        # Read result from sidecar info file
+        doc_name = "photoshop"
+        if os.path.exists(info_path):
+            with open(info_path, "r", encoding="utf-8") as fh:
+                info = fh.read().strip()
+            try:
+                os.remove(info_path)
+            except OSError:
+                pass
+            if info.startswith("ERROR:"):
+                self.report({'ERROR'}, f"PS: {info[6:]}")
+                return {'CANCELLED'}
+            if info:
+                doc_name = info
+
+        # Cleanup temp jsx
+        try:
+            os.remove(jsx_path)
+        except OSError:
+            pass
+
+        if not os.path.exists(temp_path):
+            self.report({'ERROR'}, "No document open in Photoshop")
+            return {'CANCELLED'}
+
+        # Rename with document name
+        base_name = os.path.splitext(doc_name)[0]
+        filename = get_unique_filename(gen_dir, f"ps_{base_name}", extension="png")
+        final_path = os.path.join(gen_dir, filename)
+        os.replace(temp_path, final_path)
+
+        node.result_path = final_path
+        NeuroNodeBase.invalidate_file_cache(final_path)
+        node.status_message = ""
+        self.report({'INFO'}, f"Grabbed: {doc_name}")
+        return {'FINISHED'}
+
+
 class NEURO_OT_node_manual(Operator):
     bl_idname = "neuro.node_manual"
     bl_label = "Manual"
@@ -1373,7 +1780,7 @@ class NEURO_OT_node_manual(Operator):
 
     def get_language(self, context):
         """Get current manual language from preferences"""
-        for name in [__package__, "blender_ai_nodes", "ai_nodes"]:
+        for name in [__package__, "ai_nodes"]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 return getattr(prefs, 'manual_language', 'EN')
@@ -1395,7 +1802,7 @@ class NEURO_OT_node_manual(Operator):
         layout = self.layout
 
         # Header
-        layout.label(text="Blender Nodes - Node Editor", icon='NODE')
+        layout.label(text="AI Node Editor", icon='NODE')
         layout.label(text="AI-assisted generation for professional workflows")
         layout.separator()
 
@@ -1403,11 +1810,13 @@ class NEURO_OT_node_manual(Operator):
         box = layout.box()
         box.label(text="Keyboard Shortcuts", icon='KEYINGSET')
         col = box.column(align=True)
-        col.label(text="Shift+A    Add node menu")
-        col.label(text="Shift+D    Duplicate with connections")
-        col.label(text="F          Auto-connect two selected nodes")
-        col.label(text="X          Delete selected")
-        col.label(text="Ctrl+B     Paste image from clipboard as Reference")
+        col.label(text="Shift+A          Add node menu")
+        col.label(text="Shift+D          Duplicate node with connections")
+        col.label(text="F                Auto-connect two selected nodes")
+        col.label(text="X                Delete selected")
+        col.label(text="Ctrl+B           Paste image from clipboard as Reference node")
+        col.label(text="Double-click     View node image full screen")
+        col.label(text="Enter            Generate on active node")
 
         layout.separator()
 
@@ -1433,11 +1842,12 @@ class NEURO_OT_node_manual(Operator):
 
         layout.separator()
 
-        # === TEXT GENERATION ===
+        # === TEXT NODES ===
         box = layout.box()
         box.label(text="Text Nodes", icon='TEXT')
         col = box.column(align=True)
         col.label(text="Text Node - static text input, connect to prompts")
+        col.label(text="   Open Editor button opens a full Blender text editor for long prompts")
         col.label(text="Merge Text - combine multiple text inputs with separator")
         col.label(text="Upgrade Prompt - LLM enhances your prompt for better results")
         col.label(text="Text Generation - freeform LLM text output")
@@ -1461,11 +1871,26 @@ class NEURO_OT_node_manual(Operator):
 
         layout.separator()
 
+        # === CHARACTER TEXTURE (TEAM) ===
+        box = layout.box()
+        box.label(text="Character Texture Node  [Team]", icon='ARMATURE_DATA')
+        col = box.column(align=True)
+        col.label(text="Semi-automated character texturing pipeline.")
+        col.label(text="1. Setup Camera + Back Duplicate → 2. Capture Viewport")
+        col.label(text="3. Edit enhance prompt if needed, then Generate")
+        col.label(text="4. Pick best result (1/2). Retry adds a new batch — use < > to browse.")
+        col.label(text="5. UV setup + bake runs automatically")
+        col.label(text="6. Pick best gap-fill (1/2), click Apply")
+        col.label(text="Redo Gap Fill — re-runs inpaint without losing enhance results")
+        col.label(text="Connect Prompt In to override the enhance prompt from a Text node")
+
+        layout.separator()
+
         # === DESIGN VARIATIONS ===
         box = layout.box()
         box.label(text="Design Variations Node", icon='MOD_ARRAY')
         col = box.column(align=True)
-        col.label(text="Batch exploration of design directions.")
+        col.label(text="Batch exploration of visual directions.")
         col.label(text="Simple mode: automatic variations from single image via prompt")
         col.label(text="Guided mode: specify desired changes, text model suggests variations")
         col.label(text="Results stored in history, navigate with arrows")
@@ -1480,7 +1905,7 @@ class NEURO_OT_node_manual(Operator):
         col.label(text="   Auto-connects to Tripo 3D multiview input (press F)")
         col.separator()
         col.label(text="Run Selection - execute multiple nodes in parallel")
-        col.label(text="Export/Import - save node setups with images as .zip")
+        col.label(text="Export/Import - save results with node setup as .zip")
         col.label(text="Relocate - find moved image files in new location")
 
         layout.separator()
@@ -1502,28 +1927,30 @@ class NEURO_OT_node_manual(Operator):
         box = layout.box()
         box.label(text="Tips", icon='LIGHT')
         col = box.column(align=True)
-        col.label(text="Providers panel in header - switch between API backends")
         col.label(text="Sidebar (N panel) shows list of current generations")
         col.label(text="All results auto-save to generations folder")
+        col.label(text="Double-click any result image to view it full screen")
 
     def draw_slav(self, context):
         """Russian manual"""
         layout = self.layout
 
         # Header
-        layout.label(text="Blender Nodes - Редактор Нод", icon='NODE')
-        layout.label(text="ИИ-генерация для профессиональных задач")
+        layout.label(text="ЭЯЙ - Редактор Нод", icon='NODE')
+        layout.label(text="ИИ-экосистема для профессиональных задач")
         layout.separator()
 
         # === KEYBOARD SHORTCUTS ===
         box = layout.box()
         box.label(text="Горячие клавиши", icon='KEYINGSET')
         col = box.column(align=True)
-        col.label(text="Shift+A    Меню добавления нод")
-        col.label(text="Shift+D    Дублировать с соединениями")
-        col.label(text="F          Авто-соединение двух выбранных нод")
-        col.label(text="X          Удалить выбранное")
-        col.label(text="Ctrl+B     Вставить изображение из буфера обмена")
+        col.label(text="Shift+A          Меню добавления нод")
+        col.label(text="Shift+D          Дублировать ноду с соединениями")
+        col.label(text="F                Авто-соединение двух выбранных нод")
+        col.label(text="X                Удалить выбранное")
+        col.label(text="Ctrl+B           Вставить изображение из буфера как Reference")
+        col.label(text="Двойной клик     Просмотр изображения ноды на весь экран")
+        col.label(text="Enter            Генерация на активной ноде")
 
         layout.separator()
 
@@ -1549,11 +1976,12 @@ class NEURO_OT_node_manual(Operator):
 
         layout.separator()
 
-        # === TEXT GENERATION ===
+        # === TEXT NODES ===
         box = layout.box()
         box.label(text="Текстовые Ноды", icon='TEXT')
         col = box.column(align=True)
         col.label(text="Text Node - статический текст, подключается к промптам")
+        col.label(text="   Кнопка Open Editor открывает полноценный редактор текста")
         col.label(text="Merge Text - объединяет несколько текстов разделителем")
         col.label(text="Upgrade Prompt - LLM улучшает ваш промпт для лучших результатов")
         col.label(text="Text Generation - свободная генерация текста через LLM")
@@ -1577,11 +2005,25 @@ class NEURO_OT_node_manual(Operator):
 
         layout.separator()
 
+        # === CHARACTER TEXTURE (TEAM) ===
+        box = layout.box()
+        box.label(text="Нода Character Texture  [Team]", icon='ARMATURE_DATA')
+        col = box.column(align=True)
+        col.label(text="Полуавтоматический пайплайн текстурирования персонажа.")
+        col.label(text="1. Настроить камеру + дубликат для вида сзади → 2. Захват вьюпорта")
+        col.label(text="3. При необходимости отредактировать промпт или подключить свой, затем Generate")
+        col.label(text="4. Выбрать лучший вариант (1/2). Retry добавляет новую партию — < > для навигации.")
+        col.label(text="5. UV-развёртка и бейк выполняются автоматически")
+        col.label(text="6. Выбрать лучший вариант заливки (1/2), нажать Apply")
+        col.label(text="Redo Gap Fill — повторить инпейнт без потери результатов генерации")
+
+        layout.separator()
+
         # === DESIGN VARIATIONS ===
         box = layout.box()
         box.label(text="Нода Design Variations", icon='MOD_ARRAY')
         col = box.column(align=True)
-        col.label(text="Пакетное создание вариантов дизайна.")
+        col.label(text="Пакетное создание визуальных вариаций.")
         col.label(text="Simple mode: автоматические вариации из одного изображения по промпту")
         col.label(text="Guided mode: укажите желаемые изменения, текстовая модель предложит вариации")
         col.label(text="Результаты сохраняются в истории, навигация стрелками")
@@ -1596,7 +2038,7 @@ class NEURO_OT_node_manual(Operator):
         col.label(text="   Авто-подключение к Tripo 3D multiview (нажмите F)")
         col.separator()
         col.label(text="Run Selection - запуск нескольких нод параллельно")
-        col.label(text="Export/Import - сохранение сетапа нод с изображениями в .zip")
+        col.label(text="Export/Import - сохранение результатов с сетапом в .zip")
         col.label(text="Relocate - поиск перемещенных файлов изображений")
 
         layout.separator()
@@ -1618,6 +2060,218 @@ class NEURO_OT_node_manual(Operator):
         box = layout.box()
         box.label(text="Советы", icon='LIGHT')
         col = box.column(align=True)
-        col.label(text="Панель Providers в заголовке - переключение API бекендов")
         col.label(text="Сайдбар (N панель) показывает список текущих генераций")
         col.label(text="Все результаты авто-сохраняются в папку generations")
+        col.label(text="Двойной клик по изображению — просмотр на весь экран")
+
+
+# =============================================================================
+# ADD TO SHADER — Creates Image Texture node in material
+# =============================================================================
+
+class NEURO_OT_add_to_shader(Operator):
+    """Add result image as texture node in active material"""
+    bl_idname = "neuro.add_to_shader"
+    bl_label = "Add to Shader"
+    bl_description = "Create an Image Texture node in the active material with this image"
+    node_name: StringProperty()
+
+    def execute(self, context):
+        # 1. Check object selection
+        obj = context.active_object
+        if not obj:
+            self.report({'WARNING'}, "Select an object first")
+            return {'CANCELLED'}
+
+        if obj.type != 'MESH':
+            self.report({'WARNING'}, "Select a mesh object")
+            return {'CANCELLED'}
+
+        # 2. Check material
+        if not obj.data.materials or not obj.active_material:
+            self.report({'WARNING'}, "Object has no material. Create a material first.")
+            return {'CANCELLED'}
+
+        mat = obj.active_material
+        if not mat.use_nodes:
+            mat.use_nodes = True
+
+        # 3. Get image path from node
+        image_path = ""
+        ntree = get_node_tree(context, None)
+        if ntree and self.node_name:
+            node = ntree.nodes.get(self.node_name)
+            if node:
+                if hasattr(node, 'result_path') and node.result_path:
+                    image_path = node.result_path
+                elif hasattr(node, 'get_image_path'):
+                    image_path = node.get_image_path()
+
+        if not image_path or not os.path.exists(image_path):
+            self.report({'ERROR'}, "No image to add")
+            return {'CANCELLED'}
+
+        # 4. Load image into Blender
+        img_name = os.path.basename(image_path)
+
+        # Check if already loaded
+        bpy_image = None
+        for img in bpy.data.images:
+            if img.filepath and os.path.normpath(os.path.abspath(
+                    bpy.path.abspath(img.filepath))) == os.path.normpath(os.path.abspath(image_path)):
+                bpy_image = img
+                break
+
+        if not bpy_image:
+            bpy_image = bpy.data.images.load(image_path)
+
+        # 5. Create Image Texture node in material
+        node_tree = mat.node_tree
+        tex_node = node_tree.nodes.new('ShaderNodeTexImage')
+        tex_node.image = bpy_image
+        tex_node.label = img_name
+
+        # Position it to the left of existing nodes
+        min_x = 0
+        for n in node_tree.nodes:
+            if n != tex_node and n.location.x < min_x:
+                min_x = n.location.x
+        tex_node.location = (min_x - 320, 0)
+
+        self.report({'INFO'}, f"Added '{img_name}' to {mat.name}")
+        return {'FINISHED'}
+
+
+# =============================================================================
+# REROUTE WITH MERGE — Shift+RMouse in node editor
+# =============================================================================
+
+def _segs_intersect(p1, p2, p3, p4):
+    """Return True if line segment p1-p2 intersects p3-p4."""
+    def cross2d(a, b):
+        return a[0] * b[1] - a[1] * b[0]
+    d1 = (p2[0] - p1[0], p2[1] - p1[1])
+    d2 = (p4[0] - p3[0], p4[1] - p3[1])
+    denom = cross2d(d1, d2)
+    if abs(denom) < 1e-10:
+        return False
+    diff = (p3[0] - p1[0], p3[1] - p1[1])
+    t = cross2d(diff, d2) / denom
+    u = cross2d(diff, d1) / denom
+    return 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0
+
+
+def _socket_node_pos(node, socket, is_output):
+    """Approximate node-space position of a socket centre."""
+    sockets = node.outputs if is_output else node.inputs
+    visible = [s for s in sockets if not s.hide]
+    if socket not in visible:
+        return None
+    idx = visible.index(socket)
+    x = node.location[0] + (node.width if is_output else 0)
+    y = node.location[1] - 22 - idx * 22   # 22 ≈ header + per-socket height
+    return (x, y)
+
+
+class NEURO_OT_add_reroute_merged(Operator):
+    """Shift+RMouse: drag across links to insert reroute nodes.
+    Links sharing the same source socket are merged into one reroute."""
+    bl_idname = "neuro.add_reroute_merged"
+    bl_label = "Add Reroute (Merged)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    _draw_handle = None
+    _start = None
+    _end = None
+
+    def _draw_callback(self, context):
+        if self._start is None or self._end is None:
+            return
+        try:
+            import gpu
+            from gpu_extras.batch import batch_for_shader
+            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+            batch = batch_for_shader(shader, 'LINES', {"pos": [self._start, self._end]})
+            shader.bind()
+            shader.uniform_float("color", (1.0, 1.0, 1.0, 0.6))
+            gpu.state.blend_set('ALPHA')
+            gpu.state.line_width_set(2.0)
+            batch.draw(shader)
+            gpu.state.blend_set('NONE')
+            gpu.state.line_width_set(1.0)
+        except Exception:
+            pass
+
+    def invoke(self, context, event):
+        if context.area.type != 'NODE_EDITOR':
+            return {'PASS_THROUGH'}
+        self._start = (event.mouse_region_x, event.mouse_region_y)
+        self._end = self._start
+        self._draw_handle = bpy.types.SpaceNodeEditor.draw_handler_add(
+            self._draw_callback, (context,), 'WINDOW', 'POST_PIXEL'
+        )
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        context.area.tag_redraw()
+        if event.type == 'MOUSEMOVE':
+            self._end = (event.mouse_region_x, event.mouse_region_y)
+            return {'RUNNING_MODAL'}
+        if event.type == 'RIGHTMOUSE' and event.value == 'RELEASE':
+            self._cleanup(context)
+            self._end = (event.mouse_region_x, event.mouse_region_y)
+            self._insert_reroutes(context)
+            context.area.tag_redraw()
+            return {'FINISHED'}
+        if event.type in {'ESC', 'LEFTMOUSE'}:
+            self._cleanup(context)
+            context.area.tag_redraw()
+            return {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+    def _cleanup(self, context):
+        if self._draw_handle:
+            bpy.types.SpaceNodeEditor.draw_handler_remove(self._draw_handle, 'WINDOW')
+            self._draw_handle = None
+
+    def _insert_reroutes(self, context):
+        ntree = context.space_data.node_tree
+        if not ntree or self._start == self._end:
+            return
+        v2d = context.region.view2d
+        start_v = v2d.region_to_view(*self._start)
+        end_v = v2d.region_to_view(*self._end)
+
+        # Collect links crossed by the rubber-band line
+        crossed = []
+        for link in list(ntree.links):
+            if link.is_muted:
+                continue
+            fp = _socket_node_pos(link.from_node, link.from_socket, True)
+            tp = _socket_node_pos(link.to_node, link.to_socket, False)
+            if fp and tp and _segs_intersect(start_v, end_v, fp, tp):
+                crossed.append(link)
+
+        if not crossed:
+            return
+
+        # Group by (from_node, from_socket) — same source → one reroute
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for link in crossed:
+            key = (link.from_node.name, link.from_socket.name)
+            groups[key].append(link)
+
+        mid_v = ((start_v[0] + end_v[0]) / 2, (start_v[1] + end_v[1]) / 2)
+
+        for i, (key, links) in enumerate(groups.items()):
+            reroute = ntree.nodes.new('NodeReroute')
+            reroute.location = (mid_v[0], mid_v[1] - i * 60)
+            from_socket = links[0].from_socket
+            to_sockets = [lk.to_socket for lk in links]
+            for lk in links:
+                ntree.links.remove(lk)
+            ntree.links.new(from_socket, reroute.inputs[0])
+            for ts in to_sockets:
+                ntree.links.new(reroute.outputs[0], ts)

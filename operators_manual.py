@@ -282,40 +282,6 @@ class NEURO_OT_replicate_key_info(Operator):
         box.label(text="Add credits before using.")
 
 
-class NEURO_OT_aiml_key_info(Operator):
-    """How to get AIML API Key"""
-    bl_idname = "neuro.aiml_key_info"
-    bl_label = "AIML API Key"
-    bl_description = "Instructions for getting AIML API key"
-
-    def execute(self, context):
-        return {'FINISHED'}
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_popup(self, width=450)
-
-    def draw(self, context):
-        layout = self.layout
-        layout.label(text="AIML API Key", icon='INFO')
-        layout.separator()
-
-        col = layout.column(align=True)
-        col.label(text="Unified API for LLMs+Image models.")
-        col.separator()
-        col.label(text="1. Go to: aimlapi.com")
-        col.label(text="2. Login to the dashboard.")
-        col.label(text="3. Add Plan/Credits to your account.")
-        col.label(text="4. Navigate to 'API Keys' in the sidebar.")
-        col.label(text="5. Create a new key(s) and copy it here.")
-        col.separator()
-
-        box = layout.box()
-        box.alert = True
-        box.label(text="Important: AIML is a paid service!", icon='ERROR')
-        box.label(text="AIML has NO INPUT for GPT-IMAGE-1.5 !!!")
-        box.label(text="Add credits before using.")
-
-
 class NEURO_OT_tripo_key_info(Operator):
     """How to get Tripo 3D API Key"""
     bl_idname = "neuro.tripo_key_info"
@@ -358,7 +324,6 @@ MANUAL_OPERATOR_CLASSES = (
     NEURO_OT_google_key_info,
     NEURO_OT_fal_key_info,
     NEURO_OT_replicate_key_info,
-    NEURO_OT_aiml_key_info,
     NEURO_OT_tripo_key_info,
 )
 

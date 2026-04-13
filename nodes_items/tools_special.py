@@ -28,8 +28,8 @@ class NeuroDesignVariationsNode(HistoryMixin, NeuroNodeBase, Node):
     variation_mode: EnumProperty(
         name="Mode",
         items=[
-            ('SIMPLE', "1 step: Simple", "Direct generation - describe what you want"),
-            ('GUIDED', "2 step: Text->Img", "Get Text variation and then generate"),
+            ('SIMPLE', "In 1 step: Simple", "Direct generation - describe what you want"),
+            ('GUIDED', "In 2 steps: Text->Img", "Get Text variation and then generate"),
         ],
         default='SIMPLE',
         description="Select variation workflow"
@@ -68,10 +68,21 @@ class NeuroDesignVariationsNode(HistoryMixin, NeuroNodeBase, Node):
     status_message: StringProperty(name="Status", default="")
     result_path: StringProperty(name="Result Path", default="")
     model_used: StringProperty(name="Model Used", default="")
+    is_generating: BoolProperty(name="Is Generating", default=False)
 
     # Image history
     image_history: StringProperty(name="Image History", default="[]")
     history_index: IntProperty(name="History Index", default=0, min=0)
+
+    use_inpaint: bpy.props.BoolProperty(
+        name="Inpaint",
+        description="When enabled, generation only affects the purple-painted area. "
+                    "Paint the zone first using Open Paint, then enable this toggle",
+        default=False,
+    )
+
+    # PrePaint backup path
+    prepaint_backup: StringProperty(name="PrePaint Backup", default="")
 
     def init(self, context):
         # Reset all instance properties to defaults
@@ -152,7 +163,7 @@ class NeuroDesignVariationsNode(HistoryMixin, NeuroNodeBase, Node):
         op.title = "Variation Prompt"
 
         # Show preview if we have result
-        if self.result_path and os.path.exists(self.result_path):
+        if self.result_path and self._path_exists_cached(self.result_path):
             self._draw_preview_with_nav(layout)
 
         # Generate button
@@ -201,7 +212,7 @@ class NeuroDesignVariationsNode(HistoryMixin, NeuroNodeBase, Node):
             row.operator("neuro.node_design_var_reset", text="Reset", icon='LOOP_BACK').node_name = self.name
 
             # Show preview if we have result
-            if self.result_path and os.path.exists(self.result_path):
+            if self.result_path and self._path_exists_cached(self.result_path):
                 self._draw_preview_with_nav(layout)
 
             # Generate Image button
@@ -232,11 +243,34 @@ class NeuroDesignVariationsNode(HistoryMixin, NeuroNodeBase, Node):
 
             col.label(text=f"{self.history_index + 1}/{len(history)}")
 
-        # --- ADDED: COPY BUTTON ---
+        # --- ADDED: Full bar ---
         if len(history) > 0:
-            col.separator()
+            col.separator(factor=1.5)
+            op = col.operator("neuro.node_open_paint_smart", text="", icon='BRUSH_DATA')
+            op.node_name = self.name
+
+            if self.prepaint_backup and self._path_exists_cached(self.prepaint_backup):
+                col.separator(factor=0.5)
+                op = col.operator("neuro.node_revert_paint", text="", icon='LOOP_BACK')
+                op.node_name = self.name
+
+            col.separator(factor=0.5)
+            op = col.operator("neuro.node_create_inpaint", text="", icon='CLIPUV_HLT')
+            op.node_name = self.name
+
+            col.separator(factor=2)
             op = col.operator("neuro.node_copy_image_file", text="", icon='COPYDOWN')
             op.image_path = self.result_path
+
+            # Add to shader
+            col.separator(factor=2)
+            op = col.operator("neuro.add_to_shader", text="", icon='NODE_MATERIAL')
+            op.node_name = self.name
+
+            if not self.is_generating:
+                col.separator(factor=2)
+                bg_op = col.operator("neuro.node_remove_bg", text="", icon='IMAGE_RGB_ALPHA')
+                bg_op.node_name = self.name
 
     def get_simple_prompt(self):
         """Build prompt for simple mode"""
@@ -364,10 +398,21 @@ class NeuroRelightNode(HistoryMixin, NeuroNodeBase, Node):
     status_message: StringProperty(name="Status", default="")
     result_path: StringProperty(name="Result Path", default="")
     model_used: StringProperty(name="Model Used", default="")
+    is_generating: BoolProperty(name="Is Generating", default=False)
 
     # History
     image_history: StringProperty(name="Image History", default="[]")
     history_index: IntProperty(name="History Index", default=0, min=0)
+
+    use_inpaint: bpy.props.BoolProperty(
+        name="Inpaint",
+        description="When enabled, generation only affects the purple-painted area. "
+                    "Paint the zone first using Open Paint, then enable this toggle",
+        default=False,
+    )
+
+    # PrePaint backup path
+    prepaint_backup: StringProperty(name="PrePaint Backup", default="")
 
     def init(self, context):
         # Reset all instance properties to defaults
@@ -405,7 +450,7 @@ class NeuroRelightNode(HistoryMixin, NeuroNodeBase, Node):
         if not addon_dir or not os.path.exists(addon_dir):
             try:
                 import bpy
-                for mod_name in ["blender_ai_nodes", "ai_nodes"]:
+                for mod_name in ["ai_nodes"]:
                     addon_path = bpy.utils.user_resource('SCRIPTS', path=f"addons/{mod_name}")
                     if os.path.exists(addon_path):
                         addon_dir = addon_path
@@ -472,7 +517,7 @@ class NeuroRelightNode(HistoryMixin, NeuroNodeBase, Node):
         dir_row.scale_y = 1.1
 
         # Right arrow  = light FROM LEFT (goes to right)
-        op = dir_row.operator("neuro.node_relight_direction", text="", icon='FORWARD',
+        op = dir_row.operator("neuro.node_relight_direction", text="From Left", icon='FORWARD',
                               depress=(self.light_direction == 'LEFT'))
         op.node_name = self.name
         op.direction = 'LEFT'
@@ -482,7 +527,7 @@ class NeuroRelightNode(HistoryMixin, NeuroNodeBase, Node):
         flip_op.node_name = self.name
 
         # Left arrow = light FROM RIGHT (goes to left)
-        op = dir_row.operator("neuro.node_relight_direction", text="", icon='BACK',
+        op = dir_row.operator("neuro.node_relight_direction", text="From Right", icon='BACK',
                               depress=(self.light_direction == 'RIGHT'))
         op.node_name = self.name
         op.direction = 'RIGHT'
@@ -495,23 +540,23 @@ class NeuroRelightNode(HistoryMixin, NeuroNodeBase, Node):
             action_row.operator("neuro.node_relight_cancel", text="Cancel", icon='CANCEL').node_name = self.name
         else:
             # View full image
-            if self.result_path and os.path.exists(self.result_path):
+            if self.result_path and self._path_exists_cached(self.result_path):
                 op = action_row.operator("neuro.node_view_full_image", text="", icon='FULLSCREEN_ENTER')
                 op.image_path = self.result_path
 
             # Main Relight button
-            action_row.operator("neuro.node_relight_generate", text="Relight", icon='LIGHT_SUN').node_name = self.name
-
-            # Remove BG (if have result)
-            if self.result_path and os.path.exists(self.result_path):
-                action_row.operator("neuro.node_remove_bg", text="", icon='IMAGE_RGB_ALPHA' ).node_name = self.name
-
-            # Settings toggle
+            action_row.operator("neuro.node_relight_generate", text="Generate", icon='LIGHT_SUN').node_name = self.name
             action_row.prop(self, "show_settings", text="", icon='PREFERENCES')
 
-        # Settings panel
-        if self.show_settings:
-            self._draw_settings(context, layout)
+            # Settings panel
+            layout.separator(factor=1)
+            if self.show_settings:
+                self._draw_settings(context, layout)
+
+            # Make Neutral button
+            layout.separator(factor=1)
+            action_row = layout.row(align=True)
+            action_row.operator("neuro.node_relight_neutral", text="Set Neutral Light", icon='LIGHT_HEMI').node_name = self.name
 
         # Status
         if self.status_message:
@@ -520,7 +565,6 @@ class NeuroRelightNode(HistoryMixin, NeuroNodeBase, Node):
     def _draw_settings(self, context, layout):
         """Draw settings panel"""
         box = layout.box()
-
         row = box.row(align=True)
         sub = row.split(factor=0.2, align=True)
         sub.prop(self, "use_pro_model", text="PRO", toggle=True, icon='EXPERIMENTAL')
@@ -610,11 +654,34 @@ class NeuroRelightNode(HistoryMixin, NeuroNodeBase, Node):
             # Count
             col.label(text=f"{self.history_index + 1}/{len(history)}")
 
-        # --- ADDED: COPY BUTTON ---
+        # --- ADDED: Full Bar ---
         if len(history) > 0:
-            col.separator()
+            col.separator(factor=1.5)
+            op = col.operator("neuro.node_open_paint_smart", text="", icon='BRUSH_DATA')
+            op.node_name = self.name
+
+            if self.prepaint_backup and self._path_exists_cached(self.prepaint_backup):
+                col.separator(factor=0.5)
+                op = col.operator("neuro.node_revert_paint", text="", icon='LOOP_BACK')
+                op.node_name = self.name
+
+            col.separator(factor=0.5)
+            op = col.operator("neuro.node_create_inpaint", text="", icon='CLIPUV_HLT')
+            op.node_name = self.name
+
+            col.separator(factor=2)
             op = col.operator("neuro.node_copy_image_file", text="", icon='COPYDOWN')
             op.image_path = self.result_path
+
+            # Add to shader
+            col.separator(factor=2)
+            op = col.operator("neuro.add_to_shader", text="", icon='NODE_MATERIAL')
+            op.node_name = self.name
+
+            if not self.is_generating:
+                col.separator(factor=2)
+                bg_op = col.operator("neuro.node_remove_bg", text="", icon='IMAGE_RGB_ALPHA')
+                bg_op.node_name = self.name
 
     def _draw_mini_preview(self, layout, path):
         """Draw small reference preview"""

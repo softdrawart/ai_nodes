@@ -3,11 +3,11 @@
 import os
 import bpy
 import textwrap
-from bpy.props import StringProperty, BoolProperty, EnumProperty
+from bpy.props import StringProperty, BoolProperty, EnumProperty, FloatProperty, IntProperty
 from bpy.types import Node
 
 from ..utils import get_model_name_display
-from ..nodes_core import NeuroNodeBase
+from ..nodes_core import NeuroNodeBase, _auto_select_on_type
 # This is the "Better" part: Dynamic model loading from the base module
 from .base import get_node_text_models
 
@@ -27,7 +27,9 @@ class NeuroTextNode(NeuroNodeBase, Node):
     text_content: StringProperty(
         name="Text",
         default="",
-        description="Input text"
+        description="Input text",
+        maxlen=0,
+        update=_auto_select_on_type,
     )
 
     def init(self, context):
@@ -38,9 +40,20 @@ class NeuroTextNode(NeuroNodeBase, Node):
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "text_content", text="")
-        op = layout.operator("neuro.open_text_editor", text="Open Editor", icon='GREASEPENCIL')
+        row = layout.row(align=True)
+        op = row.operator("neuro.open_text_editor", text="Open Editor", icon='GREASEPENCIL')
         op.node_name = self.name
         op.prop_name = "text_content"
+        op = row.operator("neuro.paste_to_node", text="", icon='PASTEDOWN')
+        op.node_name = self.name
+        op.prop_name = "text_content"
+
+        # Sync button if text block exists
+        text_name = f"Node_{self.name}_text_content"
+        if self._text_block_exists_cached(text_name):
+            sync_op = row.operator("neuro.sync_text_to_node", text="", icon='FILE_REFRESH')
+            sync_op.node_name = self.name
+            sync_op.prop_name = "text_content"
 
         # Show current length
         if self.text_content:
@@ -120,7 +133,7 @@ class NeuroUpgradePromptNode(NeuroNodeBase, Node):
     bl_width_default = 280
     bl_width_min = 220
 
-    input_prompt: StringProperty(name="Input", default="")
+    input_prompt: StringProperty(name="Input", default="", maxlen=0, update=_auto_select_on_type)
     output_prompt: StringProperty(name="Output", default="")
 
     upgrade_mode: EnumProperty(
@@ -142,6 +155,20 @@ class NeuroUpgradePromptNode(NeuroNodeBase, Node):
 
     is_processing: BoolProperty(name="Processing", default=False)
     status_message: StringProperty(name="Status", default="")
+    show_settings: BoolProperty(name="Settings", default=False)
+
+    # Model-specific params (shared across all text models)
+    param_temperature: FloatProperty(name="Temperature", default=1.0, min=0.3, max=2.0,
+                                     description="Creativity level")
+    param_max_tokens: IntProperty(name="Max Tokens", default=8192, min=500, max=64000,
+                                  description="Maximum length of response")
+    param_reasoning_effort: EnumProperty(name="Reasoning",
+                                         items=[('none', 'None', ''), ('low', 'Low', ''),
+                                                ('medium', 'Medium', ''), ('high', 'High', '')],
+                                         default='low', description="How much reasoning to apply")
+    param_thinking_level: EnumProperty(name="Thinking",
+                                       items=[('low', 'Normal', ''), ('high', 'Long', '')],
+                                       default='low', description="AI thinking depth")
 
     def init(self, context):
         self.inputs.new('NeuroImageSocket', "Reference")
@@ -151,6 +178,7 @@ class NeuroUpgradePromptNode(NeuroNodeBase, Node):
     def copy(self, node):
         self.is_processing = False
         self.status_message = ""
+        self.output_prompt = ""
 
     def draw_buttons(self, context, layout):
         # --- INPUT SECTION ---
@@ -164,6 +192,16 @@ class NeuroUpgradePromptNode(NeuroNodeBase, Node):
             op = row.operator("neuro.open_text_editor", text="", icon='GREASEPENCIL')
             op.node_name = self.name
             op.prop_name = "input_prompt"
+            op = row.operator("neuro.paste_to_node", text="", icon='PASTEDOWN')
+            op.node_name = self.name
+            op.prop_name = "input_prompt"
+
+            text_name = f"Node_{self.name}_input_prompt"
+            if self._text_block_exists_cached(text_name):
+                sync_op = row.operator("neuro.sync_text_to_node", text="", icon='FILE_REFRESH')
+                sync_op.node_name = self.name
+                sync_op.prop_name = "input_prompt"
+
             has_input = bool(self.input_prompt.strip())
 
         # --- MAIN ACTION ROW ---
@@ -191,16 +229,27 @@ class NeuroUpgradePromptNode(NeuroNodeBase, Node):
             sub.enabled = has_input
             sub.operator("neuro.node_upgrade_prompt", text="", icon='PLAY').node_name = self.name
 
+        # --- SETTINGS ---
+        config = self._get_cached_config()
+        if config and config.params:
+            row = layout.row()
+            row.prop(self, "show_settings", icon='TRIA_DOWN' if self.show_settings else 'TRIA_RIGHT',
+                     emboss=False)
+            if self.show_settings:
+                box = layout.box()
+                for param in config.params:
+                    prop_name = f"param_{param.name}"
+                    if hasattr(self, prop_name):
+                        box.prop(self, prop_name)
+
         # --- RESULT PREVIEW ---
         if self.output_prompt:
             box = layout.box()
-            col = box.column(align=True)  # align=True removes vertical spacing
+            col = box.column(align=True)
 
-            # Calculate wrap width based on node width (approx 7px per char)
-            # self.width is the current width of the node instance
             wrap_width = max(30, int(self.width / 5.8))
-
             lines = textwrap.wrap(self.output_prompt, width=wrap_width)
+
             for i, line in enumerate(lines):
                 if i > 3:
                     col.label(text="...")
@@ -233,7 +282,21 @@ class NeuroUpgradePromptNode(NeuroNodeBase, Node):
         if "Reference" in self.inputs and self.inputs["Reference"].is_linked:
             for link in self.inputs["Reference"].links:
                 from_node = link.from_node
-                if hasattr(from_node, 'get_image_path'): return from_node.get_image_path()
+
+                # Try getting the specific socket path first
+                if hasattr(from_node, 'get_image_path'):
+                    try:
+                        path = from_node.get_image_path(link.from_socket.name)
+                    except TypeError:
+                        path = from_node.get_image_path()
+
+                    if path and os.path.exists(path):
+                        return path
+
+                # Fallback to result path
+                elif hasattr(from_node, 'result_path') and from_node.result_path:
+                    if os.path.exists(from_node.result_path):
+                        return from_node.result_path
         return ""
 
 
@@ -249,7 +312,8 @@ class NeuroTextGenNode(NeuroNodeBase, Node):
     bl_width_default = 240
     bl_width_min = 200
 
-    input_prompt: StringProperty(name="Prompt", default="", description="Instructions for LLM")
+    input_prompt: StringProperty(name="Prompt", default="", description="Instructions for LLM", maxlen=0, update=_auto_select_on_type)
+
     output_text: StringProperty(name="Output", default="")
 
     # Use dynamic model getter
@@ -260,7 +324,23 @@ class NeuroTextGenNode(NeuroNodeBase, Node):
     )
 
     is_generating: BoolProperty(name="Generating", default=False)
+    has_generated: BoolProperty(name="Has Generated", default=False)
     status_message: StringProperty(name="Status", default="")
+    model_used: StringProperty(name="Model Used", default="")
+    show_settings: BoolProperty(name="Settings", default=False)
+
+    # Model-specific params (shared across all text models)
+    param_temperature: FloatProperty(name="Temperature", default=1.0, min=0.3, max=2.0,
+                                     description="Creativity level")
+    param_max_tokens: IntProperty(name="Max Tokens", default=8192, min=500, max=64000,
+                                  description="Maximum length of response")
+    param_reasoning_effort: EnumProperty(name="Reasoning",
+                                         items=[('none', 'None', ''), ('low', 'Low', ''),
+                                                ('medium', 'Medium', ''), ('high', 'High', '')],
+                                         default='low', description="How much reasoning to apply")
+    param_thinking_level: EnumProperty(name="Thinking",
+                                       items=[('low', 'Normal', ''), ('high', 'Long', '')],
+                                       default='low', description="AI thinking depth")
 
     def init(self, context):
         # Context input (e.g. from other text nodes)
@@ -273,6 +353,9 @@ class NeuroTextGenNode(NeuroNodeBase, Node):
     def copy(self, node):
         self.is_generating = False
         self.status_message = ""
+        self.output_text = ""
+        self.has_generated = False
+        self.model_used = ""
 
 # TODO: UI same rework as gen node ??
     def draw_buttons(self, context, layout):
@@ -286,6 +369,15 @@ class NeuroTextGenNode(NeuroNodeBase, Node):
         op = row.operator("neuro.open_text_editor", text="", icon='GREASEPENCIL')
         op.node_name = self.name
         op.prop_name = "input_prompt"
+        op = row.operator("neuro.paste_to_node", text="", icon='PASTEDOWN')
+        op.node_name = self.name
+        op.prop_name = "input_prompt"
+
+        text_name = f"Node_{self.name}_input_prompt"
+        if self._text_block_exists_cached(text_name):
+            sync_op = row.operator("neuro.sync_text_to_node", text="", icon='FILE_REFRESH')
+            sync_op.node_name = self.name
+            sync_op.prop_name = "input_prompt"
 
         # --- MAIN ACTION ROW ---
         # [View] [Model] --sep-- [Generate]
@@ -307,6 +399,19 @@ class NeuroTextGenNode(NeuroNodeBase, Node):
         else:
             # Preserved ICON: PLAY
             sub_gen.operator("neuro.node_generate_text", text="", icon='PLAY').node_name = self.name
+
+        # --- SETTINGS ---
+        config = self._get_cached_config()
+        if config and config.params:
+            row = layout.row()
+            row.prop(self, "show_settings", icon='TRIA_DOWN' if self.show_settings else 'TRIA_RIGHT',
+                     emboss=False)
+            if self.show_settings:
+                box = layout.box()
+                for param in config.params:
+                    prop_name = f"param_{param.name}"
+                    if hasattr(self, prop_name):
+                        box.prop(self, prop_name)
 
         # --- RESULT PREVIEW ---
         if self.output_text:

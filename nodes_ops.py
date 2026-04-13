@@ -15,6 +15,7 @@ from .utils import (
 from .nodes_ops_common import (
     get_node_tree, log_node_generation, log_node_result, get_artist_tool_model
 )
+from .constants import LOG_PREFIX, ADDON_NAME_CONFIG
 
 # Status tracking
 try:
@@ -39,6 +40,14 @@ class NEURO_OT_node_generate(Operator):
         """Auto-select first valid provider if current selection is invalid"""
         from .utils import get_addon_name
         try:
+            # Skip provider auto-select in neurotoken mode (proxy handles routing)
+            try:
+                from .token_utils import is_nt_active
+                if is_nt_active():
+                    return
+            except ImportError:
+                pass
+
             addon_name = get_addon_name()
             if not addon_name or addon_name not in context.preferences.addons:
                 return
@@ -50,33 +59,27 @@ class NEURO_OT_node_generate(Operator):
             current = prefs.active_provider
             current_valid = False
 
-            if current == 'aiml' and prefs.provider_aiml_enabled:
-                if getattr(scn, 'neuro_aiml_status', False) or prefs.aiml_api_key:
-                    current_valid = True
-            elif current == 'google' and prefs.provider_google_enabled:
-                if getattr(scn, 'neuro_google_status', False) or prefs.google_api_key:
+            if current == 'google' and prefs.provider_google_enabled:
+                if getattr(scn, 'neuro_google_status', False) or getattr(prefs, 'google_api_key', ''):
                     current_valid = True
             elif current == 'fal' and prefs.provider_fal_enabled:
-                if getattr(scn, 'neuro_fal_status', False) or prefs.fal_api_key:
+                if getattr(scn, 'neuro_fal_status', False) or getattr(prefs, 'fal_api_key', ''):
                     current_valid = True
             elif current == 'replicate' and prefs.provider_replicate_enabled:
-                if getattr(scn, 'neuro_replicate_status', False) or prefs.replicate_api_key:
+                if getattr(scn, 'neuro_replicate_status', False) or getattr(prefs, 'replicate_api_key', ''):
                     current_valid = True
 
             if current_valid:
                 return
 
-            # Auto-select first valid provider (priority: AIML > Google > Fal > Replicate)
-            if prefs.provider_aiml_enabled and prefs.aiml_api_key:
-                prefs.active_provider = 'aiml'
-                print(f"[{LOG_PREFIX}] Auto-selected AIML provider")
-            elif prefs.provider_google_enabled and prefs.google_api_key:
+            # Auto-select first valid provider (priority: Google > Fal > Replicate)
+            if prefs.provider_google_enabled and getattr(prefs, 'google_api_key', ''):
                 prefs.active_provider = 'google'
                 print(f"[{LOG_PREFIX}] Auto-selected Google provider")
-            elif prefs.provider_fal_enabled and prefs.fal_api_key:
+            elif prefs.provider_fal_enabled and getattr(prefs, 'fal_api_key', ''):
                 prefs.active_provider = 'fal'
                 print(f"[{LOG_PREFIX}] Auto-selected Fal provider")
-            elif prefs.provider_replicate_enabled and prefs.replicate_api_key:
+            elif prefs.provider_replicate_enabled and getattr(prefs, 'replicate_api_key', ''):
                 prefs.active_provider = 'replicate'
                 print(f"[{LOG_PREFIX}] Auto-selected Replicate provider")
         except Exception as e:
@@ -127,7 +130,7 @@ class NEURO_OT_node_generate(Operator):
                 return {'CANCELLED'}
         else:
             # Fallback check
-            google_key, fal_key, replicate_key, aiml_key = get_api_keys(context)
+            google_key, fal_key, replicate_key = get_api_keys(context)
             if (model.startswith("gpt") or model.startswith("fal")) and not fal_key:
                 self.report({'ERROR'}, "Missing Fal.AI API key")
                 return {'CANCELLED'}
@@ -157,14 +160,13 @@ class NEURO_OT_node_generate(Operator):
                 input_history = node.get_input_history()
             print(f"[{ADDON_NAME_CONFIG}] History enabled, input entries: {len(input_history)}")
 
+        scene_timeout = getattr(context.scene, 'neuro_timeout', 90)
         # Get model params from registry
         model_params = {}
-        is_aiml_model = False
         try:
-            from .model_registry import get_model, Provider
+            from .model_registry import get_model
             config = get_model(model)
             if config:
-                is_aiml_model = (config.provider == Provider.AIML)
                 for param in config.params:
                     # Check if node has this param as property
                     prop_name = f"param_{param.name}"
@@ -211,13 +213,15 @@ class NEURO_OT_node_generate(Operator):
             from .api import generate_images
             from .dependencies import FAL_AVAILABLE
             result_path, error_msg = None, None
+            save_path = None
             new_history = None
             start_time = time.time()
             try:
                 cancel_event.clear()
 
                 # Dynamic timeout based on model (Pro models need more time)
-                timeout = 180 if "pro" in model.lower() else 90
+                base_timeout = max(scene_timeout, 300)  # 300s floor for async Google image gen
+                timeout = max(base_timeout, 300) if "pro" in model.lower() else base_timeout
 
                 # use_history and input_history are captured from main thread above
 
@@ -263,15 +267,26 @@ class NEURO_OT_node_generate(Operator):
                 if imgs and not cancel_event.is_set():
                     gen_dir = get_generations_folder("nodes")
                     filename = get_unique_filename(gen_dir, sanitize_filename(prompt[:25]) or "generated")
-                    result_path = os.path.join(gen_dir, filename)
-                    imgs[0].save(result_path, format="PNG")
+                    save_path = os.path.join(gen_dir, filename)
+                    imgs[0].save(save_path, format="PNG")
+                    # Verify saved file decodes cleanly (catches partial/corrupt writes)
+                    from PIL import Image as _PV
+                    with _PV.open(save_path) as _v:
+                        _v.load()
+                    result_path = save_path  # Only set AFTER verified
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 if not cancel_event.is_set(): error_msg = str(e)[:100]
+                # Clean up partial/corrupt file if save started but result_path was never confirmed
+                if result_path is None and save_path and os.path.exists(save_path):
+                    try:
+                        os.remove(save_path)
+                    except Exception:
+                        pass
 
             duration = time.time() - start_time
-            log_node_result("Generate/Edit", result_path is not None, result_path, error_msg, duration)
+            log_node_result("Generate/Edit", model, result_path is not None, result_path, error_msg, duration)
 
             # Update job status
             if HAS_STATUS and job_id:
@@ -301,18 +316,15 @@ class NEURO_OT_node_generate(Operator):
                             # Add to image history with model
                             if hasattr(n, 'add_to_history'):
                                 n.add_to_history(final_result_path, model_save)
+                            # === PERF: Invalidate file cache ===
+                            from .nodes_core import NeuroNodeBase
+                            NeuroNodeBase.invalidate_file_cache(final_result_path)
+
                             # Store conversation history for downstream nodes
                             if final_history and hasattr(n, 'set_output_history'):
                                 n.set_output_history(final_history)
                                 print(
                                     f"[{ADDON_NAME_CONFIG}] Saved {len(final_history)} history entries to node {n.name}")
-                            # Refresh AIML balance after successful generation
-                            if is_aiml_model:
-                                try:
-                                    from .operators_providers import refresh_aiml_balance
-                                    refresh_aiml_balance()
-                                except Exception:
-                                    pass
                         elif cancel_event.is_set():
                             n.status_message = "Cancelled"
                         elif final_error:
@@ -524,6 +536,8 @@ class NEURO_OT_node_inpaint_generate(Operator):
         # Collect images: main (painted) + references from sockets
         input_images = node.get_input_images()
 
+        scene_timeout = getattr(context.scene, 'neuro_timeout', 90)
+
         # Build model params for pro model (resolution)
         model_params = {}
         resolution = "1K"
@@ -553,10 +567,12 @@ class NEURO_OT_node_inpaint_generate(Operator):
 
         def worker():
             result_path, error_msg = None, None
+            save_path = None
             start_time = time.time()
             try:
                 cancel_event.clear()
-                timeout = 180 if "pro" in model.lower() else 90
+                base_timeout = max(scene_timeout, 300)  # 300s floor for async Google image gen
+                timeout = max(base_timeout, 300) if "pro" in model.lower() else base_timeout
 
                 imgs = generate_images(
                     model_id=model,
@@ -565,6 +581,7 @@ class NEURO_OT_node_inpaint_generate(Operator):
                     num_outputs=1,
                     api_keys=api_keys,
                     timeout=timeout,
+                    aspect_ratio="match_input_image",
                     resolution=resolution,
                     model_params=model_params,
                     cancel_event=cancel_event,
@@ -575,13 +592,24 @@ class NEURO_OT_node_inpaint_generate(Operator):
                     filename = get_unique_filename(
                         gen_dir, sanitize_filename(user_prompt[:25]) or "inpaint"
                     )
-                    result_path = os.path.join(gen_dir, filename)
-                    imgs[0].save(result_path, format="PNG")
+                    save_path = os.path.join(gen_dir, filename)
+                    imgs[0].save(save_path, format="PNG")
+                    # Verify saved file decodes cleanly (catches partial/corrupt writes)
+                    from PIL import Image as _PV
+                    with _PV.open(save_path) as _v:
+                        _v.load()
+                    result_path = save_path  # Only set AFTER verified
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 if not cancel_event.is_set():
                     error_msg = str(e)[:100]
+                # Clean up partial/corrupt file if save started but result_path was never confirmed
+                if result_path is None and save_path and os.path.exists(save_path):
+                    try:
+                        os.remove(save_path)
+                    except Exception:
+                        pass
 
             duration = time.time() - start_time
             log_node_result("Inpaint", result_path is not None, result_path, error_msg, duration)
@@ -615,6 +643,9 @@ class NEURO_OT_node_inpaint_generate(Operator):
                             n.status_message = ""
                             if hasattr(n, 'add_to_history'):
                                 n.add_to_history(final_path, model_save)
+                            # === PERF: Invalidate file cache ===
+                            from .nodes_core import NeuroNodeBase
+                            NeuroNodeBase.invalidate_file_cache(final_path)
                         elif cancel_event.is_set():
                             n.status_message = "Cancelled"
                         elif final_error:
@@ -673,7 +704,7 @@ class NEURO_OT_node_rembg_execute(Operator):
 
         # Get active provider
         prefs = None
-        for name in ["blender_ai_nodes", "ai_nodes", __package__]:
+        for name in ["ai_nodes", __package__]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -713,6 +744,10 @@ class NEURO_OT_node_rembg_execute(Operator):
                         new_path = os.path.join(gen_dir, os.path.basename(result))
                         shutil.move(result, new_path)
                         n.result_path = new_path
+                        # === PERF: Invalidate file cache ===
+                        from .nodes_core import NeuroNodeBase
+                        NeuroNodeBase.invalidate_file_cache(new_path)
+
                         n.status_message = "Done!"
                         # Add to history
                         n.add_to_history(new_path)

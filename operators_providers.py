@@ -17,6 +17,7 @@ from .utils import (
     progress_timer, cancel_event, temp_files_registry,
     cleanup_temp_files
 )
+from .constants import LOG_PREFIX
 
 # =============================================================================
 # GENERATION ID TRACKING
@@ -73,16 +74,21 @@ class NEURO_OT_switch_provider(Operator):
 
         # Switch to new provider
         prefs.active_provider = self.provider
+        # === PERF: Invalidate cached enum lists ===
+        try:
+            from .nodes_items.base import invalidate_model_enum_cache
+            invalidate_model_enum_cache()
+        except ImportError:
+            pass
 
         # Get registry and new provider enum
         registry = get_registry()
         provider_map = {
-            'aiml': Provider.AIML,
             'replicate': Provider.REPLICATE,
             'google': Provider.GOOGLE,
             'fal': Provider.FAL,
         }
-        new_provider_enum = provider_map.get(self.provider, Provider.AIML)
+        new_provider_enum = provider_map.get(self.provider, Provider.GOOGLE)
 
         # Get valid models for new provider
         valid_image_models = [m.id for m in registry.get_all()
@@ -185,7 +191,20 @@ class NEURO_OT_validate_keys(Operator):
 
     def execute(self, context):
         scn = context.scene
-        google_key, fal_key, replicate_key, aiml_key = get_api_keys(context)
+        google_key, fal_key, replicate_key = get_api_keys(context)
+
+        # NeuroToken mode — proxy handles all routing, skip real API validation
+        try:
+            from .token_utils import is_nt_active
+            if is_nt_active():
+                scn.neuro_google_status = True
+                scn.neuro_fal_status = True
+                scn.neuro_replicate_status = True
+                scn.neuro_keys_checked = True
+                print(f"[{LOG_PREFIX}] Auto-validated API keys (NeuroToken mode)")
+                return {'FINISHED'}
+        except ImportError:
+            pass
 
         # Get Tripo key
         tripo_key = ""
@@ -196,7 +215,6 @@ class NEURO_OT_validate_keys(Operator):
             pass
 
         # Reset statuses
-        scn.neuro_aiml_status = False
         scn.neuro_google_status = False
         scn.neuro_fal_status = False
         scn.neuro_replicate_status = False
@@ -206,37 +224,12 @@ class NEURO_OT_validate_keys(Operator):
             # Import locally to ensure threading safety
             import requests
 
-            a_status = False
             g_status = False
             f_status = False
             r_status = False
-            aiml_balance = ""
             tripo_balance = ""
 
-            # --- 1. AIML (Billing Check) ---
-            if aiml_key:
-                try:
-                    r = requests.get(
-                        "https://api.aimlapi.com/v1/billing/balance",
-                        headers={"Authorization": f"Bearer {aiml_key}"},
-                        timeout=10
-                    )
-                    if r.status_code == 200:
-                        a_status = True
-                        data = r.json()
-                        raw_bal = data if isinstance(data, (int, float)) else data.get("balance", 0)
-
-                        # Format balance
-                        if raw_bal >= 1_000_000:
-                            aiml_balance = f"{raw_bal / 1_000_000:.1f}M cr"
-                        elif raw_bal >= 1_000:
-                            aiml_balance = f"{raw_bal / 1_000:.0f}K cr"
-                        else:
-                            aiml_balance = f"{int(raw_bal)} cr"
-                except Exception as e:
-                    print(f"[{LOG_PREFIX}] AIML Validation Failed: {e}")
-
-            # --- 2. GOOGLE (Client Check) ---
+            # --- 1. GOOGLE (Client Check) ---
             if google_key:
                 try:
                     from .dependencies import check_dependencies
@@ -250,7 +243,7 @@ class NEURO_OT_validate_keys(Operator):
                 except Exception as e:
                     print(f"[{LOG_PREFIX}] Google Validation Failed: {e}")
 
-            # --- 3. FAL (Models List Check) ---
+            # --- 2. FAL (Models List Check) ---
             if fal_key:
                 try:
                     # Robust check: List 1 model
@@ -268,7 +261,7 @@ class NEURO_OT_validate_keys(Operator):
                     if ":" in fal_key:
                         f_status = True
 
-            # --- 4. REPLICATE (Account Check) ---
+            # --- 3. REPLICATE (Account Check) ---
             if replicate_key:
                 try:
                     # Robust check: Get Account
@@ -282,7 +275,7 @@ class NEURO_OT_validate_keys(Operator):
                 except Exception as e:
                     print(f"[{LOG_PREFIX}] Replicate Validation Failed: {e}")
 
-            # --- 5. TRIPO (Balance Check) ---
+            # --- 4. TRIPO (Balance Check) ---
             if tripo_key and tripo_key.startswith("tsk_"):
                 try:
                     # We trigger the async operator, but we can't wait for it easily in this thread.
@@ -301,34 +294,26 @@ class NEURO_OT_validate_keys(Operator):
 
             # --- UPDATE UI ---
             def update_ui():
-                context.scene.neuro_aiml_status = a_status
                 context.scene.neuro_google_status = g_status
                 context.scene.neuro_fal_status = f_status
                 context.scene.neuro_replicate_status = r_status
                 context.scene.neuro_keys_checked = True
 
-                if aiml_balance:
-                    context.scene.aiml_balance = aiml_balance
-
-                # Auto-select provider logic (Preserved from your code)
+                # Auto-select provider ONLY if current provider is disabled in preferences
+                # Don't override user's choice just because key validation failed
                 try:
                     prefs = context.preferences.addons[__package__].preferences
                     current = prefs.active_provider
-                    current_valid = False
 
-                    if current == 'aiml' and prefs.provider_aiml_enabled and a_status:
-                        current_valid = True
-                    elif current == 'google' and prefs.provider_google_enabled and g_status:
-                        current_valid = True
-                    elif current == 'fal' and prefs.provider_fal_enabled and f_status:
-                        current_valid = True
-                    elif current == 'replicate' and prefs.provider_replicate_enabled and r_status:
-                        current_valid = True
+                    provider_enabled = {
+                        'google': prefs.provider_google_enabled,
+                        'fal': prefs.provider_fal_enabled,
+                        'replicate': prefs.provider_replicate_enabled,
+                    }
 
-                    if not current_valid:
-                        if prefs.provider_aiml_enabled and a_status:
-                            prefs.active_provider = 'aiml'
-                        elif prefs.provider_google_enabled and g_status:
+                    # Only auto-switch if the current provider is DISABLED in prefs
+                    if not provider_enabled.get(current, False):
+                        if prefs.provider_google_enabled and g_status:
                             prefs.active_provider = 'google'
                         elif prefs.provider_replicate_enabled and r_status:
                             prefs.active_provider = 'replicate'
@@ -382,7 +367,7 @@ class NEURO_OT_remove_background(Operator):
 
         # Get active provider
         prefs = None
-        for name in ["blender_ai_nodes", "ai_nodes", __package__]:
+        for name in ["ai_nodes", __package__]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -440,88 +425,65 @@ class NEURO_OT_remove_background(Operator):
         return {'FINISHED'}
 
 
-# =============================================================================
-# AIML BALANCE REFRESH OPERATOR
-# =============================================================================
-
-class AIML_OT_refresh_balance(Operator):
-    """Refresh AIML credit balance"""
-    bl_idname = "aiml.refresh_balance"
-    bl_label = "Refresh AIML Balance"
-    bl_description = "Refresh AIML credit balance"
+class NEURO_OT_refresh_neurotoken_balance(Operator):
+    """Refresh NeuroToken balance from proxy server"""
+    bl_idname = "neuro.refresh_neurotoken_balance"
+    bl_label = "Refresh NeuroToken Balance"
+    bl_description = "Refresh NeuroToken credit balance"
     bl_options = {'INTERNAL'}
 
     def execute(self, context):
-        import requests
+        try:
+            from .config.config_proxy import is_neurotoken_mode, get_neurotoken
+        except ImportError:
+            print(f"[{LOG_PREFIX}] Token activation failed: NeuroToken not installed ")
+            from .config import is_neurotoken_mode, get_neurotoken
 
-        # Get API key
-        prefs = None
-        for name in [__package__, "blender_ai_nodes", "ai_nodes"]:
-            if name and name in context.preferences.addons:
-                prefs = context.preferences.addons[name].preferences
-                break
-
-        if not prefs or not prefs.aiml_api_key:
-            context.scene.aiml_balance = "No Key"
+        if not is_neurotoken_mode():
+            context.scene.neurotoken_balance = ""
             return {'CANCELLED'}
 
-        api_key = prefs.aiml_api_key
+        nt_key = get_neurotoken()
 
         def fetch_balance():
             try:
-                response = requests.get(
-                    "https://api.aimlapi.com/v1/billing/balance",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    timeout=10
-                )
+                from .config.proxy  import check_balance
+                result = check_balance(nt_key)
 
-                if response.status_code == 200:
-                    data = response.json()
-                    balance = data.get("balance", 0)
-                    # Display balance in credits with K/M suffixes for readability
-                    if balance >= 1_000_000:
-                        balance_str = f"{balance / 1_000_000:.1f}M cr"
-                    elif balance >= 1_000:
-                        balance_str = f"{balance / 1_000:.0f}K cr"
-                    else:
-                        balance_str = f"{balance} cr"
+                if result and "balance" in result:
+                    bal = result["balance"]
+                    bal_str = f"{bal:.2f}"
+
+                    # Also update config_proxy cached balance
+                    try:
+                        from .config.config_proxy import refresh_neurotoken_balance
+                        refresh_neurotoken_balance()
+                    except ImportError:
+                        pass
 
                     def update_ui():
-                        bpy.context.scene.aiml_balance = balance_str
-                        bpy.context.scene.neuro_aiml_status = True
+                        bpy.context.scene.neurotoken_balance = bal_str
                         return None
 
                     bpy.app.timers.register(update_ui, first_interval=0.1)
                 else:
                     def update_err():
-                        bpy.context.scene.aiml_balance = "Error"
-                        bpy.context.scene.neuro_aiml_status = False
+                        bpy.context.scene.neurotoken_balance = "Error"
                         return None
 
                     bpy.app.timers.register(update_err, first_interval=0.1)
 
             except Exception as e:
-                print(f"[AIML] Balance check failed: {e}")
+                print(f"[NeuroToken] Balance check failed: {e}")
 
                 def update_err():
-                    bpy.context.scene.aiml_balance = "Error"
+                    bpy.context.scene.neurotoken_balance = "Error"
                     return None
 
                 bpy.app.timers.register(update_err, first_interval=0.1)
 
         threading.Thread(target=fetch_balance, daemon=True).start()
         return {'FINISHED'}
-
-
-def refresh_aiml_balance():
-    """Helper function to refresh AIML balance - call after generation"""
-    try:
-        bpy.ops.aiml.refresh_balance()
-    except Exception:
-        pass
 
 
 # =============================================================================
@@ -548,6 +510,122 @@ class NEURO_OT_cancel_generation(Operator):
 
 
 # =============================================================================
+# NEUROTOKEN ACTIVATE / DEACTIVATE
+# =============================================================================
+
+class NEURO_OT_activate_neurotoken(Operator):
+    """Validate and activate NeuroToken mode"""
+    bl_idname = "neuro.activate_neurotoken"
+    bl_label = "Activate NeuroToken"
+    bl_description = "Validate your NeuroToken key and enable unified credit mode"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        prefs = None
+        for name in [__package__, "ai_nodes"]:
+            if name and name in context.preferences.addons:
+                prefs = context.preferences.addons[name].preferences
+                break
+
+        if not prefs:
+            self.report({'ERROR'}, "Could not find addon preferences")
+            return {'CANCELLED'}
+
+        key = prefs.neurotoken_key.strip()
+        if not key:
+            prefs.neurotoken_status = 'INVALID'
+            prefs.neurotoken_message = "Please enter a NeuroToken key"
+            return {'CANCELLED'}
+
+        prefs.neurotoken_status = 'PENDING'
+        prefs.neurotoken_message = "Validating..."
+
+        def do_activate():
+            try:
+                from .config.config_proxy import activate_neurotoken
+            except ImportError:
+                print(f"[{LOG_PREFIX}] Token activation failed: NeuroToken not installed ")
+                from .config import activate_neurotoken
+
+            try:
+                ok, user_or_err, balance = activate_neurotoken(key)
+
+                if ok:
+                    bal_str = f"{balance:.2f}" if balance else "0.00"
+
+                    def update_ok():
+                        prefs.neurotoken_status = 'ACTIVE'
+                        prefs.neurotoken_user_id = user_or_err
+                        prefs.neurotoken_message = f"Active — {bal_str}"
+                        bpy.context.scene.neurotoken_balance = bal_str
+                        # === PERF: Invalidate enum caches ===
+                        try:
+                            from .nodes_items.base import invalidate_model_enum_cache
+                            invalidate_model_enum_cache()
+                        except ImportError:
+                            pass
+                        return None
+
+                    bpy.app.timers.register(update_ok, first_interval=0.1)
+                else:
+                    def update_fail():
+                        prefs.neurotoken_status = 'INVALID'
+                        prefs.neurotoken_message = str(user_or_err)
+                        return None
+
+                    bpy.app.timers.register(update_fail, first_interval=0.1)
+
+            except Exception as e:
+                def update_err():
+                    prefs.neurotoken_status = 'INVALID'
+                    prefs.neurotoken_message = f"Connection error: {e}"
+                    return None
+
+                bpy.app.timers.register(update_err, first_interval=0.1)
+
+        threading.Thread(target=do_activate, daemon=True).start()
+        return {'FINISHED'}
+
+
+class NEURO_OT_deactivate_neurotoken(Operator):
+    """Deactivate NeuroToken and return to individual API keys"""
+    bl_idname = "neuro.deactivate_neurotoken"
+    bl_label = "Deactivate NeuroToken"
+    bl_description = "Switch back to individual provider API keys"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        try:
+            from .config.config_proxy import deactivate_neurotoken
+        except ImportError:
+            from .config import deactivate_neurotoken
+
+        deactivate_neurotoken()
+
+        prefs = None
+        for name in [__package__, "ai_nodes"]:
+            if name and name in context.preferences.addons:
+                prefs = context.preferences.addons[name].preferences
+                break
+
+        if prefs:
+            prefs.neurotoken_status = 'NONE'
+            prefs.neurotoken_message = ""
+            prefs.neurotoken_user_id = ""
+
+        context.scene.neurotoken_balance = ""
+        # === PERF: Invalidate enum caches ===
+        try:
+            from .nodes_items.base import invalidate_model_enum_cache
+            invalidate_model_enum_cache()
+        except ImportError:
+            pass
+
+        self.report({'INFO'}, "NeuroToken deactivated. Using individual API keys.")
+        return {'FINISHED'}
+
+
+# =============================================================================
 # REGISTRATION
 # =============================================================================
 
@@ -556,7 +634,9 @@ PROVIDER_OPERATOR_CLASSES = (
     NEURO_OT_validate_keys,
     NEURO_OT_remove_background,
     NEURO_OT_cancel_generation,
-    AIML_OT_refresh_balance,
+    NEURO_OT_refresh_neurotoken_balance,
+    NEURO_OT_activate_neurotoken,
+    NEURO_OT_deactivate_neurotoken,
 )
 
 

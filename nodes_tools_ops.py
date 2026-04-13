@@ -12,6 +12,7 @@ from .nodes_ops_common import (
     get_node_tree, get_artist_tool_model, run_node_worker,
     save_generation_result, log_node_generation
 )
+from .constants import LOG_PREFIX, ADDON_NAME_CONFIG
 
 
 # =============================================================================
@@ -305,7 +306,8 @@ class NEURO_OT_node_artist_elements_action(Operator):
                 image_paths=[input_image],
                 num_outputs=1,
                 api_keys=api_keys,
-                timeout=90,
+                timeout=300,
+                aspect_ratio="match_input_image",
                 cancel_event=cancel_event,
             )
             if imgs and not cancel_event.is_set():
@@ -367,7 +369,8 @@ class NEURO_OT_node_artist_upscale(Operator):
                 image_paths=[input_image],
                 num_outputs=1,
                 api_keys=api_keys,
-                timeout=90,
+                timeout=300,
+                aspect_ratio="match_input_image",
                 resolution="2K",
                 cancel_event=cancel_event,
             )
@@ -414,7 +417,7 @@ class NEURO_OT_node_artist_angle(Operator):
         node.status_message = "Processing..."
 
         log_node_generation("Artist Tools: Change Angle", model_id, prompt, [input_image],
-                            {"preset": node.angle_preset, "aspect_ratio": "1:1"})
+                            {"preset": node.angle_preset})
 
         def do_work():
             imgs = generate_images(
@@ -423,8 +426,8 @@ class NEURO_OT_node_artist_angle(Operator):
                 image_paths=[input_image],
                 num_outputs=1,
                 api_keys=api_keys,
-                timeout=90,
-                aspect_ratio="1:1",
+                timeout=300,
+                aspect_ratio="match_input_image",
                 cancel_event=cancel_event,
             )
             if imgs and not cancel_event.is_set():
@@ -480,7 +483,7 @@ class NEURO_OT_node_artist_decompose(Operator):
                 image_paths=[input_image],
                 num_outputs=1,
                 api_keys=api_keys,
-                timeout=120,
+                timeout=300,
                 aspect_ratio="1:1",
                 resolution="2K",
                 cancel_event=cancel_event,
@@ -541,8 +544,8 @@ class NEURO_OT_node_artist_separation(Operator):
                 image_paths=[input_image],
                 num_outputs=1,
                 api_keys=api_keys,
-                timeout=90,
-                aspect_ratio="1:1",
+                timeout=300,
+                aspect_ratio="match_input_image",
                 cancel_event=cancel_event,
             )
             if imgs and not cancel_event.is_set():
@@ -680,7 +683,7 @@ class NEURO_OT_node_artist_multiview(Operator):
                 image_paths=[input_image],
                 num_outputs=1,
                 api_keys=api_keys,
-                timeout=120,
+                timeout=300,
                 aspect_ratio="1:1",
                 resolution="2K",
                 cancel_event=cancel_event,
@@ -849,7 +852,8 @@ class NEURO_OT_node_design_var_simple(Operator):
                 image_paths=[input_image],
                 num_outputs=1,
                 api_keys=api_keys,
-                timeout=120,
+                timeout=300,
+                aspect_ratio="1:1",
                 resolution="2K",
                 cancel_event=cancel_event,
             )
@@ -897,7 +901,7 @@ class NEURO_OT_node_design_var_prompts(Operator):
 
         # Get active provider and select appropriate Gemini 3 Pro text model
         prefs = None
-        for name in ["blender_ai_nodes", "ai_nodes", __package__]:
+        for name in ["ai_nodes", __package__]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -905,13 +909,8 @@ class NEURO_OT_node_design_var_prompts(Operator):
         active_provider = prefs.active_provider if prefs else 'google'
 
         # Map provider to Gemini 3 Pro text model
-        provider_text_models = {
-            'google': 'gemini-3-pro-preview',
-            'aiml': 'gemini-3-pro-aiml',
-            'replicate': 'gemini-3-pro-repl',
-            'fal': 'gemini-3-pro-preview',  # Fal has no text models, fallback to Google
-        }
-        model_id = provider_text_models.get(active_provider, 'gemini-3-pro-preview')
+        from .model_registry import resolve_model
+        model_id = resolve_model("text-gemini-pro", context=context)
 
         # For Fal provider, check if Google key available for text fallback
         if active_provider == 'fal':
@@ -1075,7 +1074,8 @@ class NEURO_OT_node_design_var_image(Operator):
                 image_paths=[input_image],
                 num_outputs=1,
                 api_keys=api_keys,
-                timeout=120,
+                timeout=300,
+                aspect_ratio="1:1",
                 resolution="2K",
                 cancel_event=cancel_event,
             )
@@ -1263,31 +1263,17 @@ class NEURO_OT_node_relight_generate(Operator):
 
         # Get active provider
         prefs = None
-        for name in ["blender_ai_nodes", "ai_nodes", __package__]:
+        for name in ["ai_nodes", __package__]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
 
-        active_provider = prefs.active_provider if prefs else 'aiml'
+        active_provider = prefs.active_provider if prefs else 'google'
 
         # Select model based on provider and pro setting
-        # Use actual model IDs from models.py
-        if node.use_pro_model:
-            model_map = {
-                'aiml': 'nano-banana-pro-aiml',
-                'google': 'gemini-3-pro-image-preview',
-                'replicate': 'nano-banana-pro-repl',
-                'fal': 'nano-banana-pro-fal',
-            }
-        else:
-            model_map = {
-                'aiml': 'nano-banana-aiml',
-                'google': 'gemini-2.5-flash-image',
-                'replicate': 'nano-banana-repl',
-                'fal': 'nano-banana-fal',
-            }
-
-        model_id = model_map.get(active_provider, 'nano-banana-pro-aiml')
+        from .model_registry import resolve_model
+        canonical = "nano-banana-pro" if node.use_pro_model else "nano-banana"
+        model_id = resolve_model(canonical, context=context)
 
         node.is_processing = True
         node.status_message = "Relighting..."
@@ -1315,7 +1301,8 @@ class NEURO_OT_node_relight_generate(Operator):
                     image_paths=image_paths,
                     num_outputs=1,
                     api_keys=api_keys,
-                    timeout=120,
+                    timeout=300,
+                    aspect_ratio="match_input_image",
                     cancel_event=cancel_event,
                 )
 
@@ -1344,6 +1331,102 @@ class NEURO_OT_node_relight_generate(Operator):
                 n.status_message = f"Failed: {error}" if error else "Generation failed"
 
         run_node_worker(ntree_name, node_name_str, do_work, on_complete, "Relight: Generate")
+        return {'FINISHED'}
+
+
+class NEURO_OT_node_relight_neutral(Operator):
+    """Make lighting neutral using Banana Pro"""
+    bl_idname = "neuro.node_relight_neutral"
+    bl_label = "Make Neutral"
+    node_name: StringProperty()
+
+    def execute(self, context):
+        from .api import generate_images
+
+        ntree = get_node_tree(context, None)
+        if not ntree:
+            return {'CANCELLED'}
+
+        node = ntree.nodes.get(self.node_name)
+        if not node:
+            return {'CANCELLED'}
+
+        # Get working image: use result if exists, otherwise input socket
+        if node.result_path and os.path.exists(node.result_path):
+            working_image = node.result_path
+        else:
+            working_image = node.get_input_image()
+
+        if not working_image or not os.path.exists(working_image):
+            self.report({'ERROR'}, "No image to process")
+            return {'CANCELLED'}
+
+        # Hardcoded neutral prompt
+        prompt = "make neutral lighting, neutral Ambient occlusion. No sunlight."
+
+        api_keys = get_all_api_keys(context)
+
+        # Get active provider
+        prefs = None
+        for name in ["ai_nodes", __package__]:
+            if name and name in context.preferences.addons:
+                prefs = context.preferences.addons[name].preferences
+                break
+
+        active_provider = prefs.active_provider if prefs else 'google'
+
+        # Force PRO model regardless of node setting
+        # AFTER:
+        from .model_registry import resolve_model
+        model_id = resolve_model("nano-banana-pro", context=context)
+
+        node.is_processing = True
+        node.status_message = "Neutralizing..."
+
+        ntree_name = ntree.name
+        node_name_str = node.name
+
+        def do_work():
+            try:
+                cancel_event.clear()
+
+                # Build image list: ONLY the working image, no reference cubes
+                image_paths = [working_image]
+
+                results = generate_images(
+                    model_id=model_id,
+                    prompt=prompt,
+                    image_paths=image_paths,
+                    num_outputs=1,
+                    api_keys=api_keys,
+                    timeout=300,
+                    aspect_ratio="match_input_image",
+                    cancel_event=cancel_event,
+                )
+
+                if results and len(results) > 0:
+                    gen_dir = get_generations_folder("nodes")
+                    filename = get_unique_filename(gen_dir, "relight_neutral")
+                    result_path = os.path.join(gen_dir, filename)
+                    results[0].save(result_path, format="PNG")
+                    return result_path, model_id
+                return None, None
+            except Exception as e:
+                print(f"[Relight Neutral] Error: {e}")
+                return None, str(e)
+
+        def on_complete(n, result, error, duration):
+            n.is_processing = False
+            if isinstance(result, tuple) and result[0]:
+                path, model = result
+                n.result_path = path
+                n.model_used = model
+                n.status_message = ""
+                n.add_to_history(path, model)
+            else:
+                n.status_message = f"Failed: {error}" if error else "Generation failed"
+
+        run_node_worker(ntree_name, node_name_str, do_work, on_complete, "Relight: Neutral")
         return {'FINISHED'}
 
 

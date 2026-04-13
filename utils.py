@@ -15,6 +15,8 @@ from datetime import datetime
 
 import bpy
 
+from .constants import LOG_PREFIX
+
 # =============================================================================
 # GLOBAL STATE
 # =============================================================================
@@ -308,16 +310,18 @@ def get_model_name_display(model_id):
     mid = str(model_id).lower()
 
     # GPT models
-    if "gpt-image-1.5" in mid:
-        return "GPT Image 1.5"
-    if "gpt-image-1" in mid:
-        return "GPT Image 1.0"
-    if "gpt-5.2" in mid:
-        return "GPT-5.2"
-    if "gpt-5.1" in mid:
-        return "GPT-5.1"
-    if "gpt-5-nano" in mid or "gpt-nano" in mid:
-        return "GPT-5 Nano"
+    if "gpt-image-pro" in mid or "gpt-image-1.5" in mid:
+        return "GPT Image Pro"
+    if "gpt-image-mini" in mid or "gpt-image-1-mini" in mid:
+        return "GPT Image Mini"
+    if "gpt-image" in mid:
+        return "GPT Image"
+    if "text-gpt-latest" in mid or "gpt-5.4" in mid:
+        return "GPT Latest"
+    if "text-gpt-oai" in mid or "gpt-5.2" in mid:
+        return "GPT"
+    if "text-gpt-nano" in mid or "gpt-5-nano" in mid or "gpt-nano" in mid:
+        return "GPT Nano"
 
     # Grok models
     if "grok-4" in mid or "grok4" in mid:
@@ -336,6 +340,8 @@ def get_model_name_display(model_id):
     # Nano Banana models
     if "nano-banana-pro" in mid:
         return "Nano Banana Pro"
+    if "nano-banana-mini" in mid:
+        return "Nano Banana Mini"
     if "nano-banana" in mid:
         return "Nano Banana"
 
@@ -344,8 +350,6 @@ def get_model_name_display(model_id):
         return "Gemini 3 Pro"
     if "gemini-3-flash" in mid:
         return "Gemini 3 Flash"
-    if "gemini-2.5" in mid:
-        return "Gemini 2.5"
     if "gemini" in mid:
         return "Gemini"
 
@@ -354,8 +358,8 @@ def get_model_name_display(model_id):
         return "Claude"
 
     # If nothing matched, try to make a readable name from the ID
-    # e.g., "some-model-aiml" -> "Some Model"
-    clean_id = model_id.replace("-aiml", "").replace("-repl", "").replace("-fal", "").replace("-google", "")
+    # e.g., "some-model-repl" -> "Some Model"
+    clean_id = model_id.replace("-repl", "").replace("-fal", "").replace("-google", "")
     clean_id = clean_id.replace("-", " ").replace("_", " ").title()
     if clean_id and clean_id != model_id:
         return clean_id
@@ -435,7 +439,7 @@ def get_texture_api_size(target_res, model_name):
     """Get the closest available API resolution for texture generation."""
     target = int(target_res)
 
-    if model_name == "gpt-image-1":
+    if model_name in ("gpt-image-oai", "gpt-image-1"):
         if target <= 1024:
             return "1024x1024", 1024
         elif target <= 1536:
@@ -541,7 +545,7 @@ def trigger_preview_refresh():
 # =============================================================================
 
 class NeuroProgressTimer:
-    """Simulates progress for AINodes since it has no progress API"""
+    """Simulates progress for Neuro since it has no progress API"""
 
     def __init__(self):
         self.start_time = None
@@ -586,16 +590,26 @@ progress_timer = NeuroProgressTimer()
 def get_api_keys(context):
     """Robustly get API keys from addon preferences.
 
+    In neurotoken mode, returns placeholder keys so all gatekeepers pass.
+
     Returns:
-        Tuple of (google_key, fal_key, replicate_key, aiml_key)
+        Tuple of (google_key, fal_key, replicate_key)
     """
+    # Neurotoken bypass — all keys appear valid
+    try:
+        from .token_utils import nt_bypass_api_keys_tuple
+        bypass = nt_bypass_api_keys_tuple()
+        if bypass:
+            return bypass
+    except ImportError:
+        pass
+
     google_key = ""
     fal_key = ""
     replicate_key = ""
-    aiml_key = ""
 
     addon_name = get_addon_name()
-    potential_names = [addon_name, "blender_ai_nodes", "ai_nodes"]
+    potential_names = [addon_name, "ai_nodes"]
 
     prefs = None
     for name in potential_names:
@@ -607,23 +621,33 @@ def get_api_keys(context):
         google_key = getattr(prefs, 'gemini_api_key', "")
         fal_key = getattr(prefs, 'fal_api_key', "")
         replicate_key = getattr(prefs, 'replicate_api_key', "")
-        aiml_key = getattr(prefs, 'aiml_api_key', "")
     else:
         print(f"[{LOG_PREFIX}] Error: Could not find preferences. checked: {potential_names}")
 
-    return google_key, fal_key, replicate_key, aiml_key
+    return google_key, fal_key, replicate_key
 
 
 def get_all_api_keys(context):
     """Get all API keys from addon preferences.
 
+    In neurotoken mode, returns placeholder keys so all gatekeepers pass.
+
     Returns:
-        Dict with "google", "fal", "replicate", "tripo", "openai", "aiml" keys
+        Dict with "google", "fal", "replicate", "tripo", "openai" keys
     """
-    keys = {"google": "", "fal": "", "replicate": "", "tripo": "", "openai": "", "aiml": ""}
+    # Neurotoken bypass — all keys appear valid
+    try:
+        from .token_utils import nt_bypass_api_keys
+        bypass = nt_bypass_api_keys()
+        if bypass:
+            return bypass
+    except ImportError:
+        pass
+
+    keys = {"google": "", "fal": "", "replicate": "", "tripo": "", "openai": ""}
 
     addon_name = get_addon_name()
-    potential_names = [addon_name, "blender_ai_nodes", "ai_nodes"]
+    potential_names = [addon_name, "ai_nodes"]
 
     prefs = None
     for name in potential_names:
@@ -637,7 +661,6 @@ def get_all_api_keys(context):
         keys["replicate"] = getattr(prefs, "replicate_api_key", "")
         keys["tripo"] = getattr(prefs, "tripo_api_key", "")
         keys["openai"] = getattr(prefs, "openai_api_key", "")
-        keys["aiml"] = getattr(prefs, "aiml_api_key", "")
 
     return keys
 
@@ -651,7 +674,7 @@ def get_enabled_providers(context):
     enabled = set()
 
     addon_name = get_addon_name()
-    potential_names = [addon_name, "blender_ai_nodes", "ai_nodes"]
+    potential_names = [addon_name, "ai_nodes"]
 
     prefs = None
     for name in potential_names:
@@ -666,11 +689,9 @@ def get_enabled_providers(context):
             enabled.add("replicate")
         if getattr(prefs, "provider_fal_enabled", False):
             enabled.add("fal")
-        if getattr(prefs, "provider_aiml_enabled", False):
-            enabled.add("aiml")
     else:
         # Defaults if prefs not found
-        enabled = {"google", "aiml"}
+        enabled = {"google"}
 
     return enabled
 
@@ -681,14 +702,13 @@ def get_fal_text_provider(context):
     Fal.ai has no LLM capabilities, so we need to fallback to another provider
     for text operations (prompt upgrade, text generation, etc.)
 
-    Priority: AIML (conflicts with Replicate), then Replicate (conflicts with AIML).
-    Google models can be added via fal_include_google_models but don't replace primary text source.
+    Priority: Replicate, then Google (via fal_include_google_models).
 
     Returns:
-        str: Provider name ('aiml', 'replicate', or None if no text source available)
+        str: Provider name ('replicate', 'google', or None if no text source available)
     """
     addon_name = get_addon_name()
-    potential_names = [addon_name, "blender_ai_nodes", "ai_nodes"]
+    potential_names = [addon_name, "ai_nodes"]
 
     prefs = None
     for name in potential_names:
@@ -705,42 +725,16 @@ def get_fal_text_provider(context):
 
     scn = context.scene
 
-    # Priority 1: AIML if enabled (conflicts with Replicate)
-    if getattr(prefs, 'fal_text_from_aiml', False):
-        aiml_key = getattr(prefs, 'aiml_api_key', '')
-        aiml_status = getattr(scn, 'neuro_aiml_status', False)
-        if aiml_key and aiml_status:
-            return 'aiml'
-        # If AIML selected but not connected, still try if key exists
-        if aiml_key:
-            log_verbose("AIML selected for Fal text but connection status unknown, trying anyway")
-            return 'aiml'
-
-    # Priority 2: Replicate if enabled (conflicts with AIML)
+    # Priority 1: Replicate if enabled
     if getattr(prefs, 'fal_text_from_replicate', False):
         replicate_key = getattr(prefs, 'replicate_api_key', '')
         if replicate_key:
             return 'replicate'
 
-    # Legacy fallback: Check fal_text_from_google for backward compatibility
-    if getattr(prefs, 'fal_text_from_google', False):
+    # Priority 2: fal_text_from_google / fal_include_google_models
+    if getattr(prefs, 'fal_text_from_google', False) or getattr(prefs, 'fal_include_google_models', False):
         google_key = getattr(prefs, 'gemini_api_key', '')
-        google_status = getattr(scn, 'neuro_google_status', False)
-        if google_key and google_status:
-            return 'google'
         if google_key:
-            log_verbose("Google selected for Fal text but connection status unknown, trying anyway")
-            return 'google'
-
-    # Priority 4: fal_include_google_models also enables Google as text source
-    # (User can see Google models, so they should also work for text operations)
-    if getattr(prefs, 'fal_include_google_models', False):
-        google_key = getattr(prefs, 'gemini_api_key', '')
-        google_status = getattr(scn, 'neuro_google_status', False)
-        if google_key and google_status:
-            return 'google'
-        if google_key:
-            log_verbose("Google models included for Fal, using for text operations")
             return 'google'
 
     # No text source available
@@ -758,7 +752,7 @@ def get_text_api_key_for_fal(context):
         return None, None
 
     addon_name = get_addon_name()
-    potential_names = [addon_name, "blender_ai_nodes", "ai_nodes"]
+    potential_names = [addon_name, "ai_nodes"]
 
     prefs = None
     for name in potential_names:
@@ -769,9 +763,7 @@ def get_text_api_key_for_fal(context):
     if not prefs:
         return None, None
 
-    if provider == 'aiml':
-        return 'aiml', getattr(prefs, 'aiml_api_key', '')
-    elif provider == 'google':
+    if provider == 'google':
         return 'google', getattr(prefs, 'gemini_api_key', '')
     elif provider == 'replicate':
         return 'replicate', getattr(prefs, 'replicate_api_key', '')
@@ -834,7 +826,7 @@ def load_bundled_node_groups():
 
 def get_addon_name():
     """Get the addon package name for preferences lookup"""
-    # __package__ gives us 'blender_neuro_nodes' when imported as a package
+    # __package__ gives us actual name when imported as a package
     return __package__ or __name__.split('.')[0]
 
 
@@ -889,7 +881,6 @@ def _trigger_auto_validation():
 
         # Check if any keys are configured
         has_keys = any([
-            getattr(prefs, 'aiml_api_key', ''),
             getattr(prefs, 'google_api_key', ''),
             getattr(prefs, 'fal_api_key', ''),
             getattr(prefs, 'replicate_api_key', ''),

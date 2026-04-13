@@ -15,6 +15,7 @@ from bpy.props import (
 )
 from bpy.types import Node, Operator
 
+from .constants import TOKEN_NAME
 from .nodes_core import NeuroNodeBase
 
 
@@ -71,11 +72,12 @@ class TripoGenerateNode(NeuroNodeBase, Node):
     model_version: EnumProperty(
         name="Model",
         items=[
-            ('v3.0-20250812', 'v3.0 (Latest)', 'Latest model version'),
+            ('P1-20260311', 'P1 LowPoly', 'Optimized for low-poly generation (48-20K faces)'),
+            ('v3.1-20260211', 'v3.1', 'Version 3.1'),
+            ('v3.0-20250812', 'v3.0', 'Version 3.0'),
             ('v2.5-20250123', 'v2.5', 'Version 2.5'),
-            ('v2.0-20240919', 'v2.0', 'Version 2.0'),
         ],
-        default='v3.0-20250812'
+        default='P1-20260311'
     )
 
     # --- Quality Settings ---
@@ -99,6 +101,8 @@ class TripoGenerateNode(NeuroNodeBase, Node):
                        description="Generate quad mesh instead of triangles")
     use_face_limit: BoolProperty(name="Limit Faces", default=False)
     face_limit: IntProperty(name="Face Limit", default=10000, min=1000, max=2000000)
+    p1_face_limit: IntProperty(name="Face Limit", default=15000, min=48, max=20000,
+                               description="P1 face count (48–20K)")
     auto_size: BoolProperty(name="Auto Size", default=False,
                             description="Scale to real-world dimensions (meters)")
 
@@ -114,6 +118,30 @@ class TripoGenerateNode(NeuroNodeBase, Node):
             ('object:christmas', 'Christmas', 'Christmas style'),
         ],
         default='original'
+    )
+
+    # --- P1 Settings ---
+    texture_alignment: EnumProperty(
+        name="Texture Alignment",
+        items=[
+            ('original_image', 'Original Image', 'Prioritize visual fidelity to source image'),
+            ('geometry', 'Geometry', 'Prioritize 3D structural accuracy'),
+        ],
+        default='original_image',
+        description="Texture alignment priority for image/multiview modes"
+    )
+    orientation: EnumProperty(
+        name="Orientation",
+        items=[
+            ('default', 'Default', 'Default orientation'),
+            ('align_image', 'Align to Image', 'Auto-rotate model to align with input image'),
+        ],
+        default='default',
+        description="Model orientation (image/multiview modes)"
+    )
+    enable_image_autofix: BoolProperty(
+        name="Image Autofix", default=False,
+        description="Optimize input image for better generation results"
     )
 
     # --- State ---
@@ -197,9 +225,12 @@ class TripoGenerateNode(NeuroNodeBase, Node):
         row.prop(self, "auto_import", text="", icon='IMPORT')
 
         if self.show_settings:
+            is_p1 = self.model_version.startswith("P1")
             box = layout.box()
             box.prop(self, "model_version")
-            box.prop(self, "style")
+
+            if not is_p1:
+                box.prop(self, "style")
 
             row = box.row(align=True)
             row.prop(self, "texture")
@@ -207,16 +238,28 @@ class TripoGenerateNode(NeuroNodeBase, Node):
 
             row = box.row(align=True)
             row.prop(self, "texture_quality", text="")
-            row.prop(self, "geometry_quality", text="")
+            if not is_p1:
+                row.prop(self, "geometry_quality", text="")
 
-            box.prop(self, "quad")
+            if not is_p1:
+                box.prop(self, "quad")
             box.prop(self, "auto_size")
 
-            row = box.row(align=True)
-            row.prop(self, "use_face_limit", text="")
-            sub = row.row()
-            sub.enabled = self.use_face_limit
-            sub.prop(self, "face_limit", text="Faces")
+            if is_p1:
+                box.prop(self, "p1_face_limit", text="Faces")
+            else:
+                row = box.row(align=True)
+                row.prop(self, "use_face_limit", text="")
+                sub = row.row()
+                sub.enabled = self.use_face_limit
+                sub.prop(self, "face_limit", text="Faces")
+
+            # P1-specific settings
+            if is_p1 and self.generation_mode in ('IMAGE', 'MULTIVIEW'):
+                box.prop(self, "texture_alignment")
+                box.prop(self, "orientation")
+                if self.generation_mode == 'IMAGE':
+                    box.prop(self, "enable_image_autofix")
 
         # Progress / Generate button
         if self.is_generating:
@@ -266,6 +309,15 @@ class TripoGenerateNode(NeuroNodeBase, Node):
             link = socket.links[0]
             from_node = link.from_node
             from_socket_name = link.from_socket.name
+
+            # --- NEW STANDARD SOCKET FETCH ---
+            if hasattr(from_node, 'get_image_path'):
+                try:
+                    path = from_node.get_image_path(from_socket_name)
+                except TypeError:
+                    path = from_node.get_image_path()
+                if path and os.path.exists(path):
+                    return path
 
             # 1. Check for dict output (Common in splitters)
             for dict_name in ['output_paths', 'image_paths', 'saved_paths', 'results']:
@@ -486,37 +538,60 @@ class TRIPO_OT_node_generate(Operator):
 
         # --- 1. PREPARE DATA (Main Thread) ---
         prefs = None
-        for name in [__package__, "blender_ai_nodes", "ai_nodes"]:
+        for name in [__package__, "ai_nodes"]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
 
-        if not prefs or not prefs.tripo_api_key:
-            self.report({'ERROR'}, "Tripo API key missing")
-            return {'CANCELLED'}
+        # NT mode — proxy handles the Tripo key server-side
+        try:
+            from .token_utils import is_nt_active, get_nt_key
+            nt_mode = is_nt_active()
+        except ImportError:
+            nt_mode = False
 
-        api_key = prefs.tripo_api_key
-
-        from . import api_tripo
-        if not api_tripo.TRIPO_AVAILABLE:
-            if not api_tripo.init_tripo():
-                self.report({'ERROR'}, "Tripo SDK missing")
+        if nt_mode:
+            nt_key = get_nt_key()
+            if not nt_key:
+                self.report({'ERROR'}, "NeuroToken key missing")
                 return {'CANCELLED'}
+            api_key = None  # not used in NT path
+        else:
+            if not prefs or not prefs.tripo_api_key:
+                self.report({'ERROR'}, "Tripo API key missing")
+                return {'CANCELLED'}
+            api_key = prefs.tripo_api_key
+
+            from . import api_tripo
+            if not api_tripo.TRIPO_AVAILABLE:
+                if not api_tripo.init_tripo():
+                    self.report({'ERROR'}, "Tripo SDK missing")
+                    return {'CANCELLED'}
 
         mode = node.generation_mode
         # Ensure sockets are in correct state (may not have updated after file load)
         node.update_sockets()
+        is_p1 = node.model_version.startswith("P1")
         settings = {
             "model_version": node.model_version,
             "texture": node.texture,
             "pbr": node.pbr,
             "texture_quality": node.texture_quality,
-            "geometry_quality": node.geometry_quality,
-            "quad": node.quad,
             "auto_size": node.auto_size,
-            "face_limit": node.face_limit if node.use_face_limit else None,
-            "style": node.style if node.style != 'original' else None,
+            "face_limit": node.p1_face_limit if is_p1 else (node.face_limit if node.use_face_limit else None),
         }
+        if is_p1:
+            # P1: no quad/geometry_quality/style; add P1-specific params
+            if mode in ('IMAGE', 'MULTIVIEW'):
+                settings["texture_alignment"] = node.texture_alignment
+                settings["orientation"] = node.orientation
+                if mode == 'IMAGE':
+                    settings["enable_image_autofix"] = node.enable_image_autofix
+        else:
+            # v3.x params
+            settings["geometry_quality"] = node.geometry_quality
+            settings["quad"] = node.quad
+            settings["style"] = node.style if node.style != 'original' else None
 
         try:
             input_data = {}
@@ -541,14 +616,18 @@ class TRIPO_OT_node_generate(Operator):
                 # Socket may still be named "Image" if update_sockets() didn't fire after load
                 front_path = (node.get_input_image_path("Front")
                               or node.get_input_image_path("Image"))
-                paths = [
-                    front_path,                          # Index 0: Front (required)
-                    node.get_input_image_path("Back"),   # Index 1: Back
-                    node.get_input_image_path("Left"),   # Index 2: Left
+
+                if not front_path or not os.path.exists(front_path):
+                    raise ValueError("Front image required")
+
+                raw_paths = [
+                    front_path,  # Index 0: Front (required)
+                    node.get_input_image_path("Back"),  # Index 1: Back
+                    node.get_input_image_path("Left"),  # Index 2: Left
                     node.get_input_image_path("Right"),  # Index 3: Right
                 ]
-                if not paths[0]: raise ValueError("Front image required")
-                input_data['image_paths'] = paths
+                # Filter out empty paths from unconnected sockets to prevent API crashes
+                input_data['image_paths'] = [p for p in raw_paths if p and os.path.exists(p)]
         except ValueError as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
@@ -562,31 +641,57 @@ class TRIPO_OT_node_generate(Operator):
 
         def run_generation():
             try:
+                from . import api_tripo
+
                 def callback(prog, msg):
                     msg_queue.put(("PROGRESS", prog, msg))
 
-                if mode == 'TEXT':
-                    result = api_tripo.generate_text_to_model(
-                        api_key=api_key,
-                        prompt=input_data['prompt'],
-                        negative_prompt=input_data['negative_prompt'],
-                        progress_callback=callback,
-                        **settings
-                    )
-                elif mode == 'IMAGE':
-                    result = api_tripo.generate_image_to_model(
-                        api_key=api_key,
-                        image_path=input_data['image_path'],
-                        progress_callback=callback,
-                        **settings
-                    )
-                elif mode == 'MULTIVIEW':
-                    result = api_tripo.generate_multiview_to_model(
-                        api_key=api_key,
-                        image_paths=input_data['image_paths'],
-                        progress_callback=callback,
-                        **settings
-                    )
+                if nt_mode:
+                    if mode == 'TEXT':
+                        result = api_tripo.generate_text_to_model_via_nt(
+                            nt_key=nt_key,
+                            prompt=input_data['prompt'],
+                            negative_prompt=input_data['negative_prompt'],
+                            progress_callback=callback,
+                            **settings
+                        )
+                    elif mode == 'IMAGE':
+                        result = api_tripo.generate_image_to_model_via_nt(
+                            nt_key=nt_key,
+                            image_path=input_data['image_path'],
+                            progress_callback=callback,
+                            **settings
+                        )
+                    elif mode == 'MULTIVIEW':
+                        result = api_tripo.generate_multiview_to_model_via_nt(
+                            nt_key=nt_key,
+                            image_paths=input_data['image_paths'],
+                            progress_callback=callback,
+                            **settings
+                        )
+                else:
+                    if mode == 'TEXT':
+                        result = api_tripo.generate_text_to_model(
+                            api_key=api_key,
+                            prompt=input_data['prompt'],
+                            negative_prompt=input_data['negative_prompt'],
+                            progress_callback=callback,
+                            **settings
+                        )
+                    elif mode == 'IMAGE':
+                        result = api_tripo.generate_image_to_model(
+                            api_key=api_key,
+                            image_path=input_data['image_path'],
+                            progress_callback=callback,
+                            **settings
+                        )
+                    elif mode == 'MULTIVIEW':
+                        result = api_tripo.generate_multiview_to_model(
+                            api_key=api_key,
+                            image_paths=input_data['image_paths'],
+                            progress_callback=callback,
+                            **settings
+                        )
 
                 if result.status == "success" and result.model_path:
                     msg_queue.put(("SUCCESS", result.model_path, node.auto_import,
@@ -625,6 +730,7 @@ class TRIPO_OT_node_generate(Operator):
                         node.is_generating = False
 
                         if msg[2] and model_path:  # Auto import + valid path
+                            from . import api_tripo
                             imported = api_tripo.import_glb_to_blender(model_path, msg[3] or "Tripo")
                             if imported:
                                 node.status_message = "Complete!"
@@ -706,22 +812,35 @@ class TRIPO_OT_smart_lowpoly(Operator):
 
         # Get API key
         prefs = None
-        for name in [__package__, "blender_ai_nodes", "ai_nodes"]:
+        for name in [__package__, "ai_nodes"]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
 
-        if not prefs or not prefs.tripo_api_key:
-            self.report({'ERROR'}, "Tripo API key missing")
-            return {'CANCELLED'}
+        # NT mode — proxy handles the Tripo key server-side
+        try:
+            from .token_utils import is_nt_active, get_nt_key
+            nt_mode = is_nt_active()
+        except ImportError:
+            nt_mode = False
 
-        api_key = prefs.tripo_api_key
-
-        from . import api_tripo
-        if not api_tripo.TRIPO_AVAILABLE:
-            if not api_tripo.init_tripo():
-                self.report({'ERROR'}, "Tripo SDK missing")
+        if nt_mode:
+            nt_key = get_nt_key()
+            if not nt_key:
+                self.report({'ERROR'}, "NeuroToken key missing")
                 return {'CANCELLED'}
+            api_key = None
+        else:
+            if not prefs or not prefs.tripo_api_key:
+                self.report({'ERROR'}, "Tripo API key missing")
+                return {'CANCELLED'}
+            api_key = prefs.tripo_api_key
+
+            from . import api_tripo
+            if not api_tripo.TRIPO_AVAILABLE:
+                if not api_tripo.init_tripo():
+                    self.report({'ERROR'}, "Tripo SDK missing")
+                    return {'CANCELLED'}
 
         # Prepare settings - use clamped face_limit based on quad mode
         settings = {
@@ -742,15 +861,25 @@ class TRIPO_OT_smart_lowpoly(Operator):
 
         def run_lowpoly():
             try:
+                from . import api_tripo
+
                 def callback(prog, msg):
                     msg_queue.put(("PROGRESS", prog, msg))
 
-                result = api_tripo.smart_lowpoly(
-                    api_key=api_key,
-                    original_task_id=task_id,
-                    progress_callback=callback,
-                    **settings
-                )
+                if nt_mode:
+                    result = api_tripo.smart_lowpoly_via_nt(
+                        nt_key=nt_key,
+                        original_task_id=task_id,
+                        progress_callback=callback,
+                        **settings
+                    )
+                else:
+                    result = api_tripo.smart_lowpoly(
+                        api_key=api_key,
+                        original_task_id=task_id,
+                        progress_callback=callback,
+                        **settings
+                    )
 
                 print(
                     f"[Smart LowPoly] Result: status={result.status}, model_path={result.model_path}, task_id={result.task_id}")
@@ -789,6 +918,7 @@ class TRIPO_OT_smart_lowpoly(Operator):
                         node.is_processing = False
 
                         if msg[2] and model_path:  # Auto import + valid path
+                            from . import api_tripo
                             imported = api_tripo.import_glb_to_blender(model_path, msg[3] or "LowPoly")
                             if imported:
                                 node.status_message = "Complete!"
@@ -882,9 +1012,52 @@ class TRIPO_OT_refresh_balance(Operator):
     def execute(self, context):
         import threading
 
-        # Get API key
+        # NT mode — show daily Tripo usage instead of raw balance
+        try:
+            from .token_utils import is_nt_active, get_nt_key
+            nt_mode = is_nt_active()
+        except ImportError:
+            nt_mode = False
+
+        if nt_mode:
+            nt_key = get_nt_key()
+            if not nt_key:
+                context.scene.tripo_balance = f"No {TOKEN_NAME} Key"
+                return {'CANCELLED'}
+
+            def fetch_nt_balance():
+                try:
+                    from .config.proxy import proxy_tripo_balance
+                    info = proxy_tripo_balance(nt_key)
+
+                    if info:
+                        used = info.get("usage_today", 0)
+                        limit = info.get("daily_limit", 6)
+                        remaining = max(0, limit - used)
+                        bal_str = f"Generations: {remaining}/{limit}"
+                    else:
+                        bal_str = "Generations: Error"
+
+                    def update_ui():
+                        bpy.context.scene.tripo_balance = bal_str
+                        return None
+
+                    bpy.app.timers.register(update_ui, first_interval=0.1)
+                except Exception as e:
+                    print(f"[Tripo] Balance check failed: {e}")
+
+                    def update_err():
+                        bpy.context.scene.tripo_balance = f"{TOKEN_NAME}: Error"
+                        return None
+
+                    bpy.app.timers.register(update_err, first_interval=0.1)
+
+            threading.Thread(target=fetch_nt_balance, daemon=True).start()
+            return {'FINISHED'}
+
+        # SDK mode — get API key
         prefs = None
-        for name in [__package__, "blender_ai_nodes", "ai_nodes"]:
+        for name in [__package__, "ai_nodes"]:
             if name and name in context.preferences.addons:
                 prefs = context.preferences.addons[name].preferences
                 break
@@ -902,7 +1075,6 @@ class TRIPO_OT_refresh_balance(Operator):
                     api_tripo.init_tripo()
 
                 if api_tripo.TRIPO_AVAILABLE:
-                    # Run async balance check
                     async def get_bal():
                         async with api_tripo.TripoClient(api_key=api_key) as client:
                             balance = await client.get_balance()
@@ -936,6 +1108,36 @@ def refresh_tripo_balance():
         pass
 
 
+class TRIPO_OT_enter_generate(Operator):
+    """Generate on the active Tripo node (Enter key shortcut)"""
+    bl_idname = "tripo.enter_generate"
+    bl_label = "Generate (Enter)"
+
+    def execute(self, context):
+        node_tree = getattr(context.space_data, 'node_tree', None)
+        if not node_tree:
+            return {'PASS_THROUGH'}
+        active = context.active_node
+        if not active:
+            return {'PASS_THROUGH'}
+        if getattr(active, 'is_generating', False) or getattr(active, 'is_processing', False):
+            return {'PASS_THROUGH'}
+        name = active.name
+        tree = node_tree.name
+        bid = active.bl_idname
+        if bid == 'TripoGenerateNode':
+            bpy.ops.tripo.node_generate(node_name=name, tree_name=tree)
+        elif bid == 'NeuroGenerateNode':
+            bpy.ops.neuro.node_generate(node_name=name, tree_name=tree)
+        elif bid == 'NeuroTextGenNode':
+            bpy.ops.neuro.node_generate_text(node_name=name, tree_name=tree)
+        elif bid == 'NeuroUpgradePromptNode':
+            bpy.ops.neuro.node_upgrade_prompt(node_name=name, tree_name=tree)
+        else:
+            return {'PASS_THROUGH'}
+        return {'FINISHED'}
+
+
 # =============================================================================
 # REGISTRATION
 # =============================================================================
@@ -950,6 +1152,7 @@ CLASSES = [
     TRIPO_OT_lowpoly_cancel,
     TRIPO_OT_manual_import,
     TRIPO_OT_refresh_balance,
+    TRIPO_OT_enter_generate,
 ]
 
 

@@ -57,7 +57,8 @@ class TripoResult:
 # CONFIGURATION
 # =============================================================================
 
-TRIPO_MODEL_VERSION = "v3.0-20250812"
+TRIPO_MODEL_VERSION = "v3.1-20260211"
+TRIPO_P1_VERSION = "P1-20260311"
 SMART_LOWPOLY_VERSION = "P-v2.0-20251225"
 
 DEFAULT_SETTINGS = {
@@ -71,6 +72,9 @@ DEFAULT_SETTINGS = {
     "face_limit": None,
     "style": None,
     "orientation": "default",
+    # P1-specific defaults
+    "texture_alignment": "original_image",
+    "enable_image_autofix": False,
 }
 
 DEFAULT_LOWPOLY_SETTINGS = {
@@ -170,7 +174,8 @@ def generate_multiview_to_model(
 
             async def do_upload():
                 if progress_callback: progress_callback(5, "Uploading images...")
-                return await client.multiview_to_model(
+                is_p1 = merged["model_version"].startswith("P1")
+                kwargs = dict(
                     images=clean_paths,
                     model_version=merged["model_version"],
                     face_limit=merged["face_limit"],
@@ -178,8 +183,13 @@ def generate_multiview_to_model(
                     pbr=merged["pbr"],
                     texture_quality=merged["texture_quality"],
                     auto_size=merged["auto_size"],
-                    quad=merged["quad"],
                 )
+                if is_p1:
+                    kwargs["texture_alignment"] = merged.get("texture_alignment", "original_image")
+                    kwargs["orientation"] = merged.get("orientation", "default")
+                else:
+                    kwargs["quad"] = merged.get("quad", False)
+                return await client.multiview_to_model(**kwargs)
 
             task_id = await _execute_with_retry(do_upload, progress_callback=progress_callback)
             if progress_callback: progress_callback(10, f"Processing: {task_id}")
@@ -198,7 +208,8 @@ def generate_image_to_model(api_key: str, image_path: str, progress_callback=Non
         async with TripoClient(api_key=api_key) as client:
             async def do_upload():
                 if progress_callback: progress_callback(5, "Uploading image...")
-                return await client.image_to_model(
+                is_p1 = merged["model_version"].startswith("P1")
+                kwargs = dict(
                     image=image_path,
                     model_version=merged["model_version"],
                     face_limit=merged["face_limit"],
@@ -206,8 +217,13 @@ def generate_image_to_model(api_key: str, image_path: str, progress_callback=Non
                     pbr=merged["pbr"],
                     texture_quality=merged["texture_quality"],
                     auto_size=merged["auto_size"],
-                    quad=merged["quad"],
                 )
+                if is_p1:
+                    kwargs["texture_alignment"] = merged.get("texture_alignment", "original_image")
+                    kwargs["orientation"] = merged.get("orientation", "default")
+                else:
+                    kwargs["quad"] = merged.get("quad", False)
+                return await client.image_to_model(**kwargs)
 
             task_id = await _execute_with_retry(do_upload, progress_callback=progress_callback)
             return await _poll_task(client, task_id, progress_callback)
@@ -222,7 +238,8 @@ def generate_text_to_model(api_key: str, prompt: str, negative_prompt="", progre
     async def _generate():
         async with TripoClient(api_key=api_key) as client:
             async def do_req():
-                return await client.text_to_model(
+                is_p1 = merged["model_version"].startswith("P1")
+                kwargs = dict(
                     prompt=prompt,
                     negative_prompt=negative_prompt,
                     model_version=merged["model_version"],
@@ -230,11 +247,13 @@ def generate_text_to_model(api_key: str, prompt: str, negative_prompt="", progre
                     texture=merged["texture"],
                     pbr=merged["pbr"],
                     texture_quality=merged["texture_quality"],
-                    geometry_quality=merged["geometry_quality"],
-                    style=merged["style"],
                     auto_size=merged["auto_size"],
-                    quad=merged["quad"],
                 )
+                if not is_p1:
+                    kwargs["geometry_quality"] = merged.get("geometry_quality", "standard")
+                    kwargs["style"] = merged.get("style")
+                    kwargs["quad"] = merged.get("quad", False)
+                return await client.text_to_model(**kwargs)
 
             task_id = await _execute_with_retry(do_req, progress_callback=progress_callback)
             return await _poll_task(client, task_id, progress_callback)
@@ -458,3 +477,237 @@ def import_glb_to_blender(model_path: str, name_prefix: str = "Tripo"):
         print("[Tripo] Import completed but no objects were created")
 
     return new_objects
+
+
+# =============================================================================
+# PROXY MODE — Uses CF worker instead of raw Tripo SDK
+# =============================================================================
+
+def _poll_task_via_nt(task_id: str, nt_key: str, progress_callback=None) -> TripoResult:
+    """Poll Tripo task via NT proxy until completion. Downloads GLB directly from CDN URL."""
+    import urllib.request
+
+    from .config.proxy import proxy_tripo_poll
+
+    polling_interval = 2.0
+    max_wait = 600
+    elapsed = 0
+
+    if progress_callback:
+        progress_callback(10, f"Processing: {task_id[:8]}...")
+
+    while elapsed < max_wait:
+        result = proxy_tripo_poll(task_id, nt_key)
+        status = result.get("status", "").upper()
+
+        if "SUCCESS" in status:
+            break
+        elif "FAILED" in status or "CANCELLED" in status or "BANNED" in status:
+            return TripoResult(task_id, "failed", error_message=f"Task {status}")
+
+        if progress_callback:
+            progress = result.get("progress")
+            if progress is not None:
+                display = 10 + int(float(progress) * 0.75)
+                progress_callback(display, f"Processing: {int(progress)}%")
+            else:
+                progress_callback(min(10 + int(elapsed / 4), 80), "Processing...")
+
+        time.sleep(polling_interval)
+        elapsed += polling_interval
+
+    if elapsed >= max_wait:
+        return TripoResult(task_id, "failed", error_message="Timeout waiting for task")
+
+    # Download GLB directly from pre-signed CDN URL (no auth needed)
+    download_url = result.get("download_url") or result.get("model_url")
+    if not download_url:
+        return TripoResult(task_id, "failed", error_message="No download URL in task result")
+
+    if progress_callback:
+        progress_callback(90, "Downloading model...")
+
+    output_path = os.path.join(tempfile.gettempdir(), f"tripo_{task_id[:8]}.glb")
+    try:
+        urllib.request.urlretrieve(download_url, output_path)
+    except Exception as e:
+        return TripoResult(task_id, "failed", error_message=f"Download failed: {e}")
+
+    if progress_callback:
+        progress_callback(100, "Complete!")
+
+    print(f"[Tripo NT] Task {task_id} complete. Model: {output_path}")
+    return TripoResult(task_id, "success", model_path=output_path, progress=100)
+
+
+def generate_text_to_model_via_nt(
+        nt_key: str,
+        prompt: str,
+        negative_prompt: str = "",
+        progress_callback=None,
+        **settings
+) -> TripoResult:
+    """NT-mode text-to-3D. Routes through NT proxy instead of raw Tripo SDK."""
+    from .config.proxy import proxy_tripo_task
+
+    merged = {**DEFAULT_SETTINGS, **settings}
+    is_p1 = merged["model_version"].startswith("P1")
+    params = {
+        "prompt": prompt,
+        "model_version": merged["model_version"],
+        "texture": merged["texture"],
+        "pbr": merged["pbr"],
+        "texture_quality": merged["texture_quality"],
+        "auto_size": merged["auto_size"],
+    }
+    if negative_prompt:
+        params["negative_prompt"] = negative_prompt
+    if is_p1:
+        params["orientation"] = merged.get("orientation", "default")
+    else:
+        params["geometry_quality"] = merged.get("geometry_quality", "standard")
+        params["quad"] = merged.get("quad", False)
+        if merged.get("style") is not None:
+            params["style"] = merged["style"]
+    if merged["face_limit"] is not None:
+        params["face_limit"] = merged["face_limit"]
+
+    if progress_callback:
+        progress_callback(3, "Creating task...")
+
+    result = proxy_tripo_task("text_to_model", params, nt_key)
+    task_id = result.get("task_id")
+    if not task_id:
+        return TripoResult("", "failed", error_message="No task_id returned")
+
+    return _poll_task_via_nt(task_id, nt_key, progress_callback)
+
+
+def generate_image_to_model_via_nt(
+        nt_key: str,
+        image_path: str,
+        progress_callback=None,
+        **settings
+) -> TripoResult:
+    """NT-mode image-to-3D. Uploads image via proxy, then creates task."""
+    from .config.proxy import proxy_tripo_upload, proxy_tripo_task
+
+    if not validate_image(image_path):
+        raise FileNotFoundError(f"Invalid image: {image_path}")
+
+    if progress_callback:
+        progress_callback(3, "Uploading image...")
+
+    file_token = proxy_tripo_upload(image_path, nt_key)
+
+    merged = {**DEFAULT_SETTINGS, **settings}
+    is_p1 = merged["model_version"].startswith("P1")
+    params = {
+        "file_token": file_token,
+        "model_version": merged["model_version"],
+        "texture": merged["texture"],
+        "pbr": merged["pbr"],
+        "texture_quality": merged["texture_quality"],
+        "auto_size": merged["auto_size"],
+    }
+    if merged["face_limit"] is not None:
+        params["face_limit"] = merged["face_limit"]
+    if is_p1:
+        params["texture_alignment"] = merged.get("texture_alignment", "original_image")
+        params["orientation"] = merged.get("orientation", "default")
+    else:
+        params["quad"] = merged.get("quad", False)
+
+    if progress_callback:
+        progress_callback(8, "Creating task...")
+
+    result = proxy_tripo_task("image_to_model", params, nt_key)
+    task_id = result.get("task_id")
+    if not task_id:
+        return TripoResult("", "failed", error_message="No task_id returned")
+
+    return _poll_task_via_nt(task_id, nt_key, progress_callback)
+
+
+def generate_multiview_to_model_via_nt(
+        nt_key: str,
+        image_paths: List[Optional[str]],
+        progress_callback=None,
+        **settings
+) -> TripoResult:
+    """NT-mode multiview-to-3D. Uploads each image, then creates task."""
+    from .config.proxy import proxy_tripo_upload, proxy_tripo_task
+
+    clean_paths = [p for p in image_paths if validate_image(p)]
+    if not clean_paths:
+        raise FileNotFoundError("No valid images found")
+
+    if progress_callback:
+        progress_callback(3, f"Uploading {len(clean_paths)} images...")
+
+    file_tokens = []
+    for i, path in enumerate(clean_paths):
+        if progress_callback:
+            progress_callback(3 + i * 2, f"Uploading image {i + 1}/{len(clean_paths)}...")
+        token = proxy_tripo_upload(path, nt_key)
+        file_tokens.append(token)
+
+    merged = {**DEFAULT_SETTINGS, **settings}
+    is_p1 = merged["model_version"].startswith("P1")
+    params = {
+        "file_tokens": file_tokens,
+        "model_version": merged["model_version"],
+        "texture": merged["texture"],
+        "pbr": merged["pbr"],
+        "texture_quality": merged["texture_quality"],
+        "auto_size": merged["auto_size"],
+    }
+    if merged["face_limit"] is not None:
+        params["face_limit"] = merged["face_limit"]
+    if is_p1:
+        params["texture_alignment"] = merged.get("texture_alignment", "original_image")
+        params["orientation"] = merged.get("orientation", "default")
+    else:
+        params["quad"] = merged.get("quad", False)
+
+    if progress_callback:
+        progress_callback(10, "Creating task...")
+
+    result = proxy_tripo_task("multiview_to_model", params, nt_key)
+    task_id = result.get("task_id")
+    if not task_id:
+        return TripoResult("", "failed", error_message="No task_id returned")
+
+    return _poll_task_via_nt(task_id, nt_key, progress_callback)
+
+
+def smart_lowpoly_via_nt(
+        nt_key: str,
+        original_task_id: str,
+        progress_callback=None,
+        **settings
+) -> TripoResult:
+    """NT-mode Smart LowPoly retopology via NT proxy."""
+    from .config.proxy import proxy_tripo_task
+
+    if progress_callback:
+        progress_callback(3, "Starting Smart LowPoly...")
+
+    merged = {**DEFAULT_LOWPOLY_SETTINGS, **settings}
+    params = {
+        "original_task_id": original_task_id,
+        "model_version": merged["model_version"],
+        "quad": merged["quad"],
+        "face_limit": merged["face_limit"],
+        "bake": merged["bake"],
+    }
+
+    result = proxy_tripo_task("smart_lowpoly", params, nt_key)
+    task_id = result.get("task_id")
+    if not task_id:
+        return TripoResult("", "failed", error_message="No task_id returned")
+
+    if progress_callback:
+        progress_callback(10, f"Retopologizing: {task_id[:8]}...")
+
+    return _poll_task_via_nt(task_id, nt_key, progress_callback)
